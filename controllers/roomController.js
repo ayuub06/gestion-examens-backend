@@ -1,251 +1,105 @@
-const Room = require('../models/Room');
+﻿const Room = require('../models/Room');
 const Exam = require('../models/Exam');
 
-// Create a new room
-exports.createRoom = async (req, res) => {
-  try {
-    const { nom, capacite, batiment, etage, equipment } = req.body;
-    
-    // Check if room already exists
-    const existingRoom = await Room.findOne({ nom });
-    if (existingRoom) {
-      return res.status(400).json({ message: 'Room already exists' });
-    }
-    
-    const room = new Room({
-      nom,
-      capacite,
-      batiment,
-      etage,
-      equipment: equipment || []
-    });
-    
-    await room.save();
-    res.status(201).json({ 
-      success: true, 
-      message: 'Room created successfully', 
-      room 
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
-// Get all rooms
+// ─── GET ALL ─────────────────────────────────────────────────────────────────
 exports.getAllRooms = async (req, res) => {
   try {
-    const rooms = await Room.find({ isActive: true }).sort({ batiment: 1, etage: 1, nom: 1 });
-    res.json({ success: true, rooms });
+    const { type, isActive } = req.query;
+    const filter = {};
+    if (type) filter.type = type;
+    if (isActive !== undefined) filter.isActive = isActive === 'true';
+
+    const rooms = await Room.find(filter).sort({ batiment: 1, nom: 1 });
+    res.json({ success: true, count: rooms.length, rooms });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// Get room by ID
+// ─── GET ONE ─────────────────────────────────────────────────────────────────
 exports.getRoomById = async (req, res) => {
   try {
     const room = await Room.findById(req.params.id);
-    if (!room) {
-      return res.status(404).json({ message: 'Room not found' });
-    }
+    if (!room) return res.status(404).json({ success: false, message: 'Salle introuvable.' });
     res.json({ success: true, room });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// Update room
+// ─── CREATE ──────────────────────────────────────────────────────────────────
+exports.createRoom = async (req, res) => {
+  try {
+    const room = new Room(req.body);
+    await room.save();
+    res.status(201).json({ success: true, room });
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(400).json({ success: false, message: 'Une salle avec ce nom existe déjà.' });
+    }
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ─── UPDATE ──────────────────────────────────────────────────────────────────
 exports.updateRoom = async (req, res) => {
   try {
-    const { nom, capacite, batiment, etage, equipment } = req.body;
-    
-    const room = await Room.findByIdAndUpdate(
-      req.params.id,
-      { nom, capacite, batiment, etage, equipment },
-      { new: true, runValidators: true }
-    );
-    
-    if (!room) {
-      return res.status(404).json({ message: 'Room not found' });
-    }
-    
-    res.json({ 
-      success: true, 
-      message: 'Room updated successfully', 
-      room 
-    });
+    const room = await Room.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!room) return res.status(404).json({ success: false, message: 'Salle introuvable.' });
+    res.json({ success: true, room });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// Delete room (soft delete)
+// ─── DELETE ──────────────────────────────────────────────────────────────────
 exports.deleteRoom = async (req, res) => {
   try {
-    // Check if room has upcoming exams
-    const upcomingExams = await Exam.findOne({
-      salle: req.params.id,
-      date: { $gte: new Date() },
-      status: { $ne: 'completed' }
-    });
-    
-    if (upcomingExams) {
-      return res.status(400).json({ 
-        message: 'Cannot delete room with upcoming exams. Please reschedule exams first.' 
-      });
+    // Check if room has future exams
+    const futureExam = await Exam.findOne({ salle: req.params.id, date: { $gte: new Date() } });
+    if (futureExam) {
+      return res.status(400).json({ success: false, message: 'Impossible de supprimer: la salle a des examens planifiés.' });
     }
-    
-    const room = await Room.findByIdAndUpdate(
-      req.params.id,
-      { isActive: false },
-      { new: true }
-    );
-    
-    if (!room) {
-      return res.status(404).json({ message: 'Room not found' });
-    }
-    
-    res.json({ 
-      success: true, 
-      message: 'Room deleted successfully' 
-    });
+    const room = await Room.findByIdAndDelete(req.params.id);
+    if (!room) return res.status(404).json({ success: false, message: 'Salle introuvable.' });
+    res.json({ success: true, message: 'Salle supprimée.' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// Check room availability
+// ─── CHECK AVAILABILITY ──────────────────────────────────────────────────────
 exports.checkAvailability = async (req, res) => {
   try {
-    const { roomId, date, heure_debut, heure_fin } = req.body;
-    
-    if (!roomId || !date || !heure_debut || !heure_fin) {
-      return res.status(400).json({ message: 'Missing required fields' });
-    }
-    
-    // Check for conflicting exams
-    const conflictingExam = await Exam.findOne({
-      salle: roomId,
-      date: new Date(date),
-      $or: [
-        {
-          heure_debut: { $lt: heure_fin },
-          heure_fin: { $gt: heure_debut }
-        }
-      ],
-      status: { $ne: 'cancelled' }
+    const { date, heure_debut, heure_fin } = req.query;
+    const toMin = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
+
+    const rooms = await Room.find({ isActive: true });
+    const examsOnDate = await Exam.find({ date: new Date(date) });
+
+    const availability = rooms.map((room) => {
+      const conflicts = examsOnDate.filter(
+        (e) => e.salle.toString() === room._id.toString() &&
+          toMin(heure_debut) < toMin(e.heure_fin) &&
+          toMin(heure_fin) > toMin(e.heure_debut)
+      );
+      return { ...room.toObject(), available: conflicts.length === 0, conflicts };
     });
-    
-    res.json({ 
-      available: !conflictingExam,
-      conflictingExam: conflictingExam || null
-    });
+
+    res.json({ success: true, rooms: availability });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// Get available rooms for a specific time slot
-exports.getAvailableRooms = async (req, res) => {
+// ─── GET ROOM EXAMS ──────────────────────────────────────────────────────────
+exports.getRoomExams = async (req, res) => {
   try {
-    const { date, heure_debut, heure_fin, minCapacity } = req.body;
-    
-    if (!date || !heure_debut || !heure_fin) {
-      return res.status(400).json({ message: 'Missing required fields' });
-    }
-    
-    // Find all active rooms
-    let query = { isActive: true };
-    if (minCapacity) {
-      query.capacite = { $gte: minCapacity };
-    }
-    
-    const allRooms = await Room.find(query);
-    
-    // Find rooms that are busy during the requested time
-    const busyRooms = await Exam.find({
-      date: new Date(date),
-      $or: [
-        {
-          heure_debut: { $lt: heure_fin },
-          heure_fin: { $gt: heure_debut }
-        }
-      ],
-      status: { $ne: 'cancelled' }
-    }).distinct('salle');
-    
-    // Filter available rooms
-    const availableRooms = allRooms.filter(room => 
-      !busyRooms.some(busyRoomId => busyRoomId.toString() === room._id.toString())
-    );
-    
-    res.json({ 
-      success: true, 
-      availableRooms,
-      totalRooms: allRooms.length,
-      busyRooms: busyRooms.length
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
-// Get room schedule
-exports.getRoomSchedule = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { startDate, endDate } = req.query;
-    
-    const room = await Room.findById(id);
-    if (!room) {
-      return res.status(404).json({ message: 'Room not found' });
-    }
-    
-    let query = { salle: id };
-    
-    if (startDate || endDate) {
-      query.date = {};
-      if (startDate) query.date.$gte = new Date(startDate);
-      if (endDate) query.date.$lte = new Date(endDate);
-    }
-    
-    const exams = await Exam.find(query)
-      .populate('surveillant', 'name prenom email')
+    const exams = await Exam.find({ salle: req.params.id })
+      .populate('surveillant', 'name prenom')
       .sort({ date: 1, heure_debut: 1 });
-    
-    res.json({ 
-      success: true, 
-      room,
-      schedule: exams 
-    });
+    res.json({ success: true, exams });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-};
-
-// Get rooms statistics
-exports.getRoomStatistics = async (req, res) => {
-  try {
-    const totalRooms = await Room.countDocuments({ isActive: true });
-    const totalCapacity = await Room.aggregate([
-      { $match: { isActive: true } },
-      { $group: { _id: null, total: { $sum: '$capacite' } } }
-    ]);
-    
-    const roomsByBuilding = await Room.aggregate([
-      { $match: { isActive: true } },
-      { $group: { _id: '$batiment', count: { $sum: 1 }, totalCapacity: { $sum: '$capacite' } } }
-    ]);
-    
-    res.json({
-      success: true,
-      statistics: {
-        totalRooms,
-        totalCapacity: totalCapacity[0]?.total || 0,
-        roomsByBuilding
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ success: false, message: error.message });
   }
 };

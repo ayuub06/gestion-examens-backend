@@ -1,20 +1,20 @@
-import axios from 'axios';
+import axios from "axios";
 
-// Use environment variable or fallback to localhost for development
-const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+const API_URL = "http://localhost:5000/api";
 
-console.log('API URL:', API_URL); // This will help debug
-
-const API = axios.create({
+const api = axios.create({
   baseURL: API_URL,
+  headers: {
+    "Content-Type": "application/json",
+  },
 });
 
-API.interceptors.request.use((config) => {
-  const token = localStorage.getItem('token');
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem("token");
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
   return config;
 });
 
-export default API;
+export default api;

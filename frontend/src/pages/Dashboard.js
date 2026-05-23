@@ -20,16 +20,28 @@ const Dashboard = () => {
   const [showStudentForm, setShowStudentForm] = useState(false);
   const [showProfessorForm, setShowProfessorForm] = useState(false);
   const [userFilter, setUserFilter] = useState('all');
-  // Export PDF function
-const exportToPDF = () => {
-  if (isStudent) {
-    generateStudentPDF(user, exams);
-  } else if (isProfessor) {
-    generateProfessorPDF(user, exams);
-  } else if (isAdmin) {
-    generateAdminPDF(exams);
-  }
-};
+
+   // Debug - Afficher la structure des examens
+console.log('=== STRUCTURE DES EXAMENS ===');
+console.log('Exams:', exams);
+if (exams && exams[0]) {
+    console.log('Premier examen:', exams[0]);
+    console.log('Clés du premier examen:', Object.keys(exams[0]));
+    console.log('Etudiants du premier examen:', exams[0].etudiants);
+} 
+
+   const handleExportPDF = () => {
+    if (isStudent && user && exams) {
+      generateStudentPDF(user, exams);
+    } else if (isProfessor && user && exams) {
+      generateProfessorPDF(user, exams);
+    } else if (isAdmin && exams) {
+      generateAdminPDF(exams);
+    } else {
+      alert('No data to export');
+    }
+  };
+
   useEffect(() => {
     fetchData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -39,17 +51,13 @@ const exportToPDF = () => {
   setLoading(true);
   try {
     if (activeTab === 'exams') {
-  const res = await API.get('/exams');
-  console.log('Exams fetched:', res.data.exams?.length);
-  setExams(res.data.exams || []);
-  } else if (activeTab === 'exams') {
-  const res = await API.get('/exams');
-  console.log('=== EXAMS FETCHED ===');
-  console.log('Total exams:', res.data.exams?.length);
-  console.log('First exam:', res.data.exams?.[0]);
-  setExams(res.data.exams || []);
-
-}
+      let endpoint = '/exams';
+      if (isStudent)   endpoint = '/exams/my-exams';        // filtered by dept+level
+      if (isProfessor) endpoint = '/exams/my-supervisions'; // filtered by surveillant
+      const res = await API.get(endpoint);
+      console.log('Exams fetched:', res.data.exams?.length);
+      setExams(res.data.exams || []);
+    }
     else if (activeTab === 'rooms') {
       const res = await API.get('/rooms');
       setRooms(res.data.rooms || []);
@@ -286,12 +294,12 @@ const exportToPDF = () => {
             <button onClick={() => setActiveTab('exams')} className={`tab-btn ${activeTab === 'exams' ? 'active' : 'inactive'}`}>📝 Exams</button>
             {/* PDF EXPORT BUTTON */}
   <button 
-    onClick={exportToPDF} 
-    className="tab-btn" 
-    style={{ background: '#dc2626', color: 'white', marginLeft: 'auto' }}
-  >
-    📄 Export PDF
-  </button>
+        onClick={handleExportPDF} 
+        className="tab-btn" 
+        style={{ background: '#dc2626', color: 'white', marginLeft: 'auto' }}
+      >
+        📄 Export PDF
+      </button>
             {isAdmin && (
               <>
                 <button onClick={() => setActiveTab('users')} className={`tab-btn ${activeTab === 'users' ? 'active' : 'inactive'}`}>👥 Users</button>
@@ -313,8 +321,9 @@ const exportToPDF = () => {
           setLoading(true);
           try {
             const response = await API.post('/scheduling/auto-generate', { year: 2025, month: 1 });
-            alert(`✅ Scheduled ${response.data.results.scheduled.length} exams\n❌ Failed: ${response.data.results.conflicts.length}`);
-            fetchData();
+alert(`✅ Scheduled ${response.data.results.scheduled.length} exams successfully!`);
+
+fetchData();
           } catch (error) {
             alert('Error: ' + error.response?.data?.message);
           }
