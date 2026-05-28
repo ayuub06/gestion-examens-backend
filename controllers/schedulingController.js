@@ -1,326 +1,456 @@
-﻿const Exam = require('../models/Exam');
-const Module = require('../models/Module');
-const Room = require('../models/Room');
-const User = require('../models/User');
+const Module   = require('../models/Module');
+const Room     = require('../models/Room');
+const User     = require('../models/User');
+const Exam     = require('../models/Exam');
+const mongoose = require('mongoose');
 
-const TIME_SLOTS = [
-  { start: '08:00', end: '10:00' },
-  { start: '10:30', end: '12:30' },
-  { start: '14:00', end: '16:00' },
-  { start: '16:30', end: '18:30' },
-];
-
-// Convert "HH:MM" to minutes for overlap detection
-const toMin = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
-const hasOverlap = (s1, e1, s2, e2) => toMin(s1) < toMin(e2) && toMin(e1) > toMin(s2);
-
-// Build array of Date objects for a date range
-const buildDates = (startDay, endDay, month = 0, year = 2025) => {
-  const dates = [];
-  for (let d = startDay; d <= endDay; d++) {
-    dates.push(new Date(year, month, d));
-  }
-  return dates;
-};
-
-// Fisher-Yates shuffle
-const shuffle = (arr) => {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
+// ── helpers ───────────────────────────────────────────────────────────────────
+const toMin    = t => { const [h,m]=t.split(':').map(Number); return h*60+m; };
+const overlaps = (s1,e1,s2,e2) => toMin(s1)<toMin(e2) && toMin(e1)>toMin(s2);
+const shuffle  = arr => {
+  const a=[...arr];
+  for(let i=a.length-1;i>0;i--){
+    const j=Math.floor(Math.random()*(i+1));
+    [a[i],a[j]]=[a[j],a[i]];
   }
   return a;
 };
 
-// ─── AUTO-GENERATE ───────────────────────────────────────────────────────────
+// Build working days (Mon–Sat, skip Sun) between two ISO date strings inclusive
+const buildWorkingDaysInRange = (startISO, endISO) => {
+  const days = [];
+  const d   = new Date(startISO + 'T12:00:00Z');
+  const end = new Date(endISO   + 'T12:00:00Z');
+  while (d <= end) {
+    if (d.getUTCDay() !== 0) days.push(new Date(d));
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return days;
+};
+
+const TIME_SLOTS = [
+  { start:'08:00', end:'10:00' },
+  { start:'10:30', end:'12:30' },
+  { start:'14:00', end:'16:00' },
+  { start:'16:30', end:'18:30' },
+];
+
+// Semester → student niveau values in DB (covers both DUT/Bachelor and legacy S1-S6 stored directly)
+const SEM_TO_NIVEAU = {
+  S1: ['DUT1','S1'],
+  S2: ['DUT1','S2'],
+  S3: ['DUT2','S3'],
+  S4: ['DUT2','S4'],
+  S5: ['Bachelor','S5'],
+  S6: ['Bachelor','S6'],
+};
+
+const ROOM_SURVEILLANTS = { amphi:3, grande_salle:2, petite_salle:1, labo:1 };
+
+const pickRoomType = (examType, count) => {
+  if (examType === 'pratique') return 'labo';
+  if (count > 80)  return 'amphi';
+  if (count > 30)  return 'grande_salle';
+  return 'petite_salle';
+};
+
+const ROOM_FALLBACK = {
+  amphi:        ['amphi','grande_salle','petite_salle'],
+  grande_salle: ['grande_salle','amphi','petite_salle'],
+  petite_salle: ['petite_salle','grande_salle','amphi'],
+  labo:         ['labo','petite_salle','grande_salle','amphi'],
+};
+
+// Fixed session config: normale = S1/S3/S5 (01-07 Jun), rattrapage = S2/S4/S6 (08-15 Jun)
+const SESSION_CONFIG = {
+  normale:    { start:'2026-06-01', end:'2026-06-07', semesters:['S1','S3','S5'], label:'Normale (01–07 Juin 2026)' },
+  rattrapage: { start:'2026-06-08', end:'2026-06-15', semesters:['S2','S4','S6'], label:'Rattrapage (08–15 Juin 2026)' },
+};
+
+// ── GET /api/scheduling/current-session ───────────────────────────────────────
+exports.getCurrentSession = (req, res) => {
+  res.json({ success:true, session: SESSION_CONFIG });
+};
+
+// ── CHECK AVAILABILITY ────────────────────────────────────────────────────────
+exports.checkAvailability = async (req, res) => {
+  try {
+    const { date, heure_debut, heure_fin, salleId, supervisorId } = req.body;
+    const result = { available:true, roomConflict:null, supervisorConflict:null };
+
+    if (salleId) {
+      const ex = await Exam.find({ salle:salleId, date:new Date(date) });
+      result.roomConflict = ex.find(e=>overlaps(heure_debut,heure_fin,e.heure_debut,e.heure_fin)) || null;
+    }
+    if (supervisorId) {
+      const ex = await Exam.find({ surveillant:supervisorId, date:new Date(date) });
+      result.supervisorConflict = ex.find(e=>overlaps(heure_debut,heure_fin,e.heure_debut,e.heure_fin)) || null;
+    }
+    result.available = !result.roomConflict && !result.supervisorConflict;
+    res.json({ success:true, ...result });
+  } catch(err) {
+    res.status(500).json({ success:false, message:err.message });
+  }
+};
+
+// ── MANUAL SCHEDULE ───────────────────────────────────────────────────────────
+exports.scheduleExam = async (req, res) => {
+  try {
+    const { moduleId, date, heure_debut, heure_fin, salleId, superviseurIds } = req.body;
+    if (!moduleId||!date||!heure_debut||!heure_fin||!salleId||!superviseurIds?.length)
+      return res.status(400).json({ success:false, message:'Champs obligatoires manquants.' });
+
+    const [mod, room] = await Promise.all([Module.findById(moduleId), Room.findById(salleId)]);
+    if (!mod)  return res.status(404).json({ success:false, message:'Module introuvable.' });
+    if (!room) return res.status(404).json({ success:false, message:'Salle introuvable.' });
+
+    const roomExams = await Exam.find({ salle:salleId, date:new Date(date) });
+    if (roomExams.some(e=>overlaps(heure_debut,heure_fin,e.heure_debut,e.heure_fin)))
+      return res.status(409).json({ success:false, message:`Salle ${room.nom} déjà occupée à ce créneau.` });
+
+    const profExams = await Exam.find({ surveillant:superviseurIds[0], date:new Date(date) });
+    if (profExams.some(e=>overlaps(heure_debut,heure_fin,e.heure_debut,e.heure_fin)))
+      return res.status(409).json({ success:false, message:'Ce surveillant est déjà occupé à ce créneau.' });
+
+    const niveaux  = SEM_TO_NIVEAU[mod.semester] || [];
+    const students = await User.find({
+      role:'etudiant',
+      ...(mod.department !== 'COMMON' ? { departement:mod.department } : {}),
+      niveau:{ $in:niveaux },
+    }).select('_id');
+
+    const exam = new Exam({
+      module:mod.name, code_module:mod.code,
+      date:new Date(date), heure_debut, heure_fin,
+      salle:salleId, surveillant:superviseurIds[0], surveillants:superviseurIds,
+      etudiants:students.map(s=>s._id),
+      type:'exam', nombre_etudiants:students.length||30,
+      department:mod.department, semester:mod.semester,
+    });
+    await exam.save();
+
+    const populated = await Exam.findById(exam._id)
+      .populate('salle','nom capacite type')
+      .populate('surveillant','name prenom specialization')
+      .populate('surveillants','name prenom');
+
+    res.json({ success:true, message:'Examen planifié.', exam:populated });
+  } catch(err) {
+    if (err.code===11000) return res.status(409).json({ success:false, message:'Ce créneau/salle est déjà pris.' });
+    res.status(500).json({ success:false, message:err.message });
+  }
+};
+
+// ── AUTO GENERATE ─────────────────────────────────────────────────────────────
 exports.autoGenerateSchedule = async (req, res) => {
   try {
-    console.log('🎯 DÉMARRAGE GÉNÉRATION AUTOMATIQUE...');
+    console.log('\n🎯 ═══ GÉNÉRATION AUTOMATIQUE 2026 ═══');
+    console.log(`   Normale    : ${SESSION_CONFIG.normale.label}  → ${SESSION_CONFIG.normale.semesters.join(',')}`);
+    console.log(`   Rattrapage : ${SESSION_CONFIG.rattrapage.label} → ${SESSION_CONFIG.rattrapage.semesters.join(',')}`);
 
-    await Exam.deleteMany({});
-    console.log('🗑️  Anciens examens supprimés');
+    // ── Step 1: fix rooms missing a type field ──────────────────────────────
+    const noTypeRooms = await Room.find({ type:{ $exists:false }, isActive:{ $ne:false } });
+    if (noTypeRooms.length) {
+      console.log(`🔧 Fixing ${noTypeRooms.length} rooms without type...`);
+      for (const r of noTypeRooms) {
+        let type;
+        if      (r.capacite > 100) type = 'amphi';
+        else if (r.capacite > 30)  type = 'grande_salle';
+        else                        type = 'petite_salle';
+        await Room.findByIdAndUpdate(r._id, { $set:{ type } });
+        console.log(`   ${r.nom} (cap ${r.capacite}) → ${type}`);
+      }
+    }
 
-    // FIX: Removed { isActive: true } for rooms — fetch all rooms
-    const [modules, rooms, professors] = await Promise.all([
-      Module.find({}),
-      Room.find({}),
-      User.find({ role: 'professeur' }),
+    // ── Step 2: delete ALL existing exams ─────────────────────────────────
+    const del = await Exam.deleteMany({});
+    console.log(`🗑️  ${del.deletedCount} examens supprimés`);
+
+    // ── Step 3: load data ──────────────────────────────────────────────────
+    const allSemesters = [...SESSION_CONFIG.normale.semesters, ...SESSION_CONFIG.rattrapage.semesters];
+    const [allModules, rooms, professors] = await Promise.all([
+      Module.find({ semester:{ $in:allSemesters } }),
+      Room.find({ isActive:{ $ne:false } }),
+      User.find({ role:'professeur' }),
     ]);
 
-    console.log(`📚 Modules: ${modules.length} | 🏫 Salles: ${rooms.length} | 👨‍🏫 Profs: ${professors.length}`);
+    if (!allModules.length)  return res.status(400).json({ success:false, message:'Aucun module trouvé. Lancez: npm run seed' });
+    if (!rooms.length)       return res.status(400).json({ success:false, message:'Aucune salle. Lancez: npm run seed' });
+    if (!professors.length)  return res.status(400).json({ success:false, message:'Aucun professeur. Lancez: npm run seed' });
 
-    if (!modules.length) return res.status(400).json({ success: false, message: 'Aucun module trouvé. Exécutez le script seed.' });
-    if (!rooms.length) return res.status(400).json({ success: false, message: 'Aucune salle trouvée. Exécutez le script seed.' });
-    if (!professors.length) return res.status(400).json({ success: false, message: 'Aucun professeur trouvé. Exécutez le script seed.' });
+    console.log(`\n📚 ${allModules.length} modules | 🏫 ${rooms.length} salles | 👨‍🏫 ${professors.length} profs`);
 
-    // Pre-load students grouped by department+semester
-    const allStudents = await User.find({ role: 'etudiant' }).select('_id departement niveau');
-    const studentMap = {};
-    allStudents.forEach((s) => {
-      const key = `${s.departement}_${s.niveau}`;
-      if (!studentMap[key]) studentMap[key] = [];
-      studentMap[key].push(s._id);
+    // ── Step 4: student map ────────────────────────────────────────────────
+    const allStudents = await User.find({ role:'etudiant' }).select('_id departement niveau');
+    const studentMap  = {};
+    allStudents.forEach(s => {
+      if (!s.departement || !s.niveau) return;
+      const k = `${s.departement}_${s.niveau}`;
+      if (!studentMap[k]) studentMap[k] = [];
+      studentMap[k].push(s._id);
     });
-    console.log(`👨‍🎓 Groupes étudiants: ${Object.keys(studentMap).join(', ')}`);
 
-    // Session dates
-    const normalDates = buildDates(1, 7);    // 01-07 jan 2025
-    const rattrapageDates = buildDates(8, 15); // 08-15 jan 2025
+    console.log('\n👥 Groupes étudiants:');
+    Object.entries(studentMap).forEach(([k,v]) => console.log(`   ${k}: ${v.length}`));
 
-    // Split modules into sessions (odd semesters → normale, even → rattrapage)
-    const normalModules = shuffle(modules.filter(m => ['S1', 'S3', 'S5'].includes(m.semester)));
-    const rattrapageModules = shuffle(modules.filter(m => ['S2', 'S4', 'S6'].includes(m.semester)));
+    // ── Step 5: helpers ────────────────────────────────────────────────────
 
-    // Fallback: if no semester filter matches, split evenly
-    const useNormal = normalModules.length ? normalModules : shuffle(modules).slice(0, Math.ceil(modules.length / 2));
-    const useRattrapage = rattrapageModules.length ? rattrapageModules : shuffle(modules).slice(Math.ceil(modules.length / 2));
-
-    const scheduledExams = [];
-    const conflicts = [];
-
-    // In-memory busy tracking: profBusy[profId][dateStr] = [{start, end}]
-    const profBusy = {};
-    const roomBusy = {};
-
-    const isProfFree = (profId, dateStr, start, end) => {
-      const slots = profBusy[profId]?.[dateStr] || [];
-      if (slots.length >= 2) return false; // max 2 exams/day per prof
-      return !slots.some(s => hasOverlap(start, end, s.start, s.end));
-    };
-    const isRoomFree = (roomId, dateStr, start, end) => {
-      const slots = roomBusy[roomId]?.[dateStr] || [];
-      return !slots.some(s => hasOverlap(start, end, s.start, s.end));
-    };
-    const markProf = (profId, dateStr, start, end) => {
-      if (!profBusy[profId]) profBusy[profId] = {};
-      if (!profBusy[profId][dateStr]) profBusy[profId][dateStr] = [];
-      profBusy[profId][dateStr].push({ start, end });
-    };
-    const markRoom = (roomId, dateStr, start, end) => {
-      if (!roomBusy[roomId]) roomBusy[roomId] = {};
-      if (!roomBusy[roomId][dateStr]) roomBusy[roomId][dateStr] = [];
-      roomBusy[roomId][dateStr].push({ start, end });
+    // Which studentMap keys are relevant for a module
+    const getGroupKeys = (mod) => {
+      const niveaux = SEM_TO_NIVEAU[mod.semester] || [];
+      const keys = [];
+      if (mod.department === 'COMMON') {
+        Object.keys(studentMap).forEach(k => {
+          if (niveaux.some(niv => k.endsWith('_' + niv))) keys.push(k);
+        });
+      } else {
+        niveaux.forEach(niv => {
+          const k = `${mod.department}_${niv}`;
+          if (studentMap[k]) keys.push(k);
+        });
+      }
+      return keys;
     };
 
-    // FIX: True round-robin professor index per session
+    const getStudentIds = (mod) => {
+      const keys = getGroupKeys(mod);
+      const seen = new Set();
+      const ids  = [];
+      keys.forEach(k => {
+        (studentMap[k] || []).forEach(id => {
+          const s = id.toString();
+          if (!seen.has(s)) { seen.add(s); ids.push(id); }
+        });
+      });
+      return ids;
+    };
+
+    // In-memory busy trackers
+    const profBusy  = {}; // profBusy[profId][ds] = [{start,end}]
+    const roomBusy  = {}; // roomBusy[roomId][ds] = [{start,end}]
+    const groupSlot = {}; // groupSlot[groupKey][ds+slot] = true  (overlap prevention)
+    const groupDay  = {}; // groupDay[groupKey][ds] = count       (max 2/day)
+
+    const isProfFree = (id, ds, s, e) => {
+      const sl = profBusy[id]?.[ds] || [];
+      if (sl.length >= 2) return false;
+      return !sl.some(x => overlaps(s, e, x.start, x.end));
+    };
+
+    const isRoomFree = (id, ds, s, e) =>
+      !(roomBusy[id]?.[ds] || []).some(x => overlaps(s, e, x.start, x.end));
+
+    // Check student group: no simultaneous exam, max 2/day
+    const isGroupFree = (mod, ds, slotStart) => {
+      const slotKey = `${ds}_${slotStart}`;
+      return getGroupKeys(mod).every(k => {
+        if (groupSlot[k]?.[slotKey])          return false; // overlap
+        if ((groupDay[k]?.[ds] || 0) >= 2)    return false; // max 2/day
+        return true;
+      });
+    };
+
+    const markProf = (id, ds, s, e) => {
+      if (!profBusy[id])     profBusy[id]     = {};
+      if (!profBusy[id][ds]) profBusy[id][ds] = [];
+      profBusy[id][ds].push({ start:s, end:e });
+    };
+    const markRoom = (id, ds, s, e) => {
+      if (!roomBusy[id])     roomBusy[id]     = {};
+      if (!roomBusy[id][ds]) roomBusy[id][ds] = [];
+      roomBusy[id][ds].push({ start:s, end:e });
+    };
+    const markGroup = (mod, ds, slotStart) => {
+      const slotKey = `${ds}_${slotStart}`;
+      getGroupKeys(mod).forEach(k => {
+        if (!groupSlot[k])     groupSlot[k]     = {};
+        if (!groupDay[k])      groupDay[k]       = {};
+        groupSlot[k][slotKey]  = true;
+        groupDay[k][ds]        = (groupDay[k][ds] || 0) + 1;
+      });
+    };
+
+    // Persistent round-robin professor picker
+    const profList = shuffle([...professors]);
     let profIdx = 0;
 
-    const scheduleSession = async (sessionModules, sessionDates, sessionName) => {
-      let modIdx = 0;
+    const pickProf = (ds, s, e) => {
+      const n = profList.length;
+      for (let attempt = 0; attempt < n; attempt++) {
+        const candidate = profList[profIdx % n];
+        profIdx = (profIdx + 1) % n;
+        if (isProfFree(candidate._id.toString(), ds, s, e)) return candidate;
+      }
+      return null;
+    };
 
-      for (const date of sessionDates) {
-        if (modIdx >= sessionModules.length) break;
-        const dateStr = date.toISOString().split('T')[0];
+    const pickRoom = (examType, count, ds, s, e) => {
+      const pref  = pickRoomType(examType, count);
+      const order = ROOM_FALLBACK[pref] || [pref];
+      for (const rt of order) {
+        const r = rooms.find(r => r.type === rt && r.capacite >= count && isRoomFree(r._id.toString(), ds, s, e));
+        if (r) return r;
+      }
+      // last resort: largest free room regardless of capacity
+      return rooms
+        .filter(r => isRoomFree(r._id.toString(), ds, s, e))
+        .sort((a, b) => b.capacite - a.capacite)[0] || null;
+    };
 
-        for (const slot of TIME_SLOTS) {
-          if (modIdx >= sessionModules.length) break;
-          const mod = sessionModules[modIdx];
+    // ── Step 6: core scheduler ─────────────────────────────────────────────
+    const scheduledExams = [];
+    const conflicts      = [];
 
-          // Get students for this module's dept+semester
-          const studentKey = `${mod.department}_${mod.semester}`;
-          const studentIds = studentMap[studentKey] || [];
-          const needed = studentIds.length || 1;
+    const scheduleSession = async (sessionMods, sessionDates, sessionName) => {
+      // COMMON modules first so shared group slots are claimed before dept-specific ones
+      const common = shuffle(sessionMods.filter(m => m.department === 'COMMON'));
+      const deptSpecific = shuffle(sessionMods.filter(m => m.department !== 'COMMON'));
+      const mods = [...common, ...deptSpecific];
+      const numDays = sessionDates.length;
+      console.log(`\n📅 [${sessionName.toUpperCase()}] ${mods.length} modules / ${numDays} jours`);
+      console.log(`   Jours: ${sessionDates.map(d=>d.toISOString().split('T')[0]).join(', ')}`);
 
-          // FIX: Find available room with sufficient capacity
-          const room = rooms.find(r => r.capacite >= needed && isRoomFree(r._id.toString(), dateStr, slot.start, slot.end));
-          if (!room) {
-            // Try any available room (ignore capacity constraint as fallback)
-            const anyRoom = rooms.find(r => isRoomFree(r._id.toString(), dateStr, slot.start, slot.end));
-            if (!anyRoom) {
-              conflicts.push({ module: mod.code, reason: `Aucune salle disponible: ${dateStr} ${slot.start}` });
-              modIdx++;
-              continue;
+      for (let mi = 0; mi < mods.length; mi++) {
+        const mod     = mods[mi];
+        let   placed  = false;
+
+        // Rotate starting day to spread exams across the full period
+        const startDayIdx = mi % numDays;
+
+        dayLoop:
+        for (let di = 0; di < numDays && !placed; di++) {
+          const date = sessionDates[(startDayIdx + di) % numDays];
+          const ds   = date.toISOString().split('T')[0];
+
+          for (const slot of TIME_SLOTS) {
+            // 1. Check student group constraints
+            if (!isGroupFree(mod, ds, slot.start)) continue;
+
+            // 2. Find a free room with enough capacity
+            const studentIds = getStudentIds(mod);
+            const count      = studentIds.length || 30;
+            const room       = pickRoom(mod.examType || 'theorique', count, ds, slot.start, slot.end);
+            if (!room) continue;
+
+            // 3. Find a free professor
+            const prof = pickProf(ds, slot.start, slot.end);
+            if (!prof) continue;
+
+            // 4. Pick co-surveillants based on room type
+            const needed = ROOM_SURVEILLANTS[room.type] || 1;
+            const extras = [];
+            for (const p of profList) {
+              if (extras.length >= needed - 1) break;
+              if (p._id.toString() === prof._id.toString()) continue;
+              if (isProfFree(p._id.toString(), ds, slot.start, slot.end)) {
+                extras.push(p._id);
+                markProf(p._id.toString(), ds, slot.start, slot.end);
+              }
             }
-          }
 
-          const chosenRoom = rooms.find(r => r.capacite >= needed && isRoomFree(r._id.toString(), dateStr, slot.start, slot.end))
-            || rooms.find(r => isRoomFree(r._id.toString(), dateStr, slot.start, slot.end));
+            // 5. Convert IDs and save exam
+            const etudiantOids = studentIds.map(id => {
+              try { return new mongoose.Types.ObjectId(id.toString()); } catch { return null; }
+            }).filter(Boolean);
 
-          // FIX: Round-robin professor — try each starting at profIdx
-          let chosenProf = null;
-          for (let a = 0; a < professors.length; a++) {
-            const candidate = professors[(profIdx + a) % professors.length];
-            if (isProfFree(candidate._id.toString(), dateStr, slot.start, slot.end)) {
-              chosenProf = candidate;
-              profIdx = (profIdx + a + 1) % professors.length; // advance for next call
-              break;
+            const exam = new Exam({
+              module:      mod.name,
+              code_module: mod.code,
+              date,
+              heure_debut: slot.start,
+              heure_fin:   slot.end,
+              salle:       room._id,
+              surveillant: prof._id,
+              surveillants:[prof._id, ...extras],
+              etudiants:   etudiantOids,
+              type:        'exam',
+              nombre_etudiants: count,
+              department:  mod.department || 'GI',
+              semester:    mod.semester   || 'S1',
+              session:     sessionName,
+            });
+
+            try { await exam.save(); }
+            catch (se) {
+              if (se.code === 11000) continue; // index conflict — try next slot
+              throw se;
             }
+
+            // 6. Mark all trackers AFTER successful save
+            markProf(prof._id.toString(), ds, slot.start, slot.end);
+            markRoom(room._id.toString(), ds, slot.start, slot.end);
+            markGroup(mod, ds, slot.start);
+
+            scheduledExams.push({
+              module:    mod.name,
+              code:      mod.code,
+              dept:      mod.department,
+              semester:  mod.semester,
+              session:   sessionName,
+              date:      ds,
+              time:      `${slot.start}–${slot.end}`,
+              room:      room.nom,
+              roomType:  room.type,
+              supervisor:`${prof.name} ${prof.prenom}`,
+              surveillantsTotal: 1 + extras.length,
+              students:  count,
+            });
+
+            console.log(`✅ [${sessionName}] ${mod.code.padEnd(12)} | ${ds} ${slot.start} | ${room.nom.padEnd(10)} | ${prof.name} ${prof.prenom} | ${count} ét.`);
+            placed = true;
+            break;
           }
+        }
 
-          if (!chosenProf) {
-            conflicts.push({ module: mod.code, reason: `Aucun prof disponible: ${dateStr} ${slot.start}` });
-            modIdx++;
-            continue;
-          }
-
-          const exam = new Exam({
-            module: mod.name,
-            code_module: mod.code,
-            date,
-            heure_debut: slot.start,
-            heure_fin: slot.end,
-            salle: chosenRoom._id,
-            surveillant: chosenProf._id,
-            etudiants: studentIds,
-            nombre_etudiants: studentIds.length || chosenRoom.capacite,
-            department: mod.department || 'GI',
-            semester: mod.semester || 'S1',
-            session: sessionName,
-            type: 'exam',
-            status: 'scheduled',
-          });
-
-          await exam.save();
-
-          markProf(chosenProf._id.toString(), dateStr, slot.start, slot.end);
-          markRoom(chosenRoom._id.toString(), dateStr, slot.start, slot.end);
-
-          scheduledExams.push({
-            module: mod.name,
-            code: mod.code,
-            date: dateStr,
-            time: `${slot.start} - ${slot.end}`,
-            room: chosenRoom.nom,
-            supervisor: `${chosenProf.name} ${chosenProf.prenom}`,
-            students: studentIds.length,
-            session: sessionName,
-          });
-
-          console.log(`✅ [${sessionName}] ${mod.code} | ${dateStr} ${slot.start} | ${chosenRoom.nom} | ${chosenProf.name} ${chosenProf.prenom} | ${studentIds.length} étudiants`);
-          modIdx++;
+        if (!placed) {
+          conflicts.push({ module:mod.code, semester:mod.semester, reason:'Plus de créneaux disponibles' });
+          console.warn(`⚠️  [${sessionName}] ${mod.code} (${mod.semester}) — aucun créneau trouvé`);
         }
       }
     };
 
-    await scheduleSession(useNormal, normalDates, 'normale');
-    await scheduleSession(useRattrapage, rattrapageDates, 'rattrapage');
+    // ── Step 7: split modules by semester and schedule ─────────────────────
+    const normaleMods    = allModules.filter(m => SESSION_CONFIG.normale.semesters.includes(m.semester));
+    const rattrapageMods = allModules.filter(m => SESSION_CONFIG.rattrapage.semesters.includes(m.semester));
 
-    // Build professor distribution summary
+    const normaleDates    = buildWorkingDaysInRange(SESSION_CONFIG.normale.start,    SESSION_CONFIG.normale.end);
+    const rattrapageDates = buildWorkingDaysInRange(SESSION_CONFIG.rattrapage.start, SESSION_CONFIG.rattrapage.end);
+
+    console.log(`\n📅 Normale    (${normaleMods.length} modules): ${normaleDates.map(d=>d.toISOString().split('T')[0]).join(', ')}`);
+    console.log(`📅 Rattrapage (${rattrapageMods.length} modules): ${rattrapageDates.map(d=>d.toISOString().split('T')[0]).join(', ')}`);
+
+    await scheduleSession(normaleMods,    normaleDates,    'normale');
+    await scheduleSession(rattrapageMods, rattrapageDates, 'rattrapage');
+
+    // ── Professor distribution report ──────────────────────────────────────
+    console.log('\n📊 DISTRIBUTION PROFESSEURS:');
     const profDist = {};
-    scheduledExams.forEach(e => {
-      profDist[e.supervisor] = (profDist[e.supervisor] || 0) + 1;
-    });
-    console.log('\n📊 Distribution profs:', profDist);
-    console.log(`\n✅ Total: ${scheduledExams.length} examens | ⚠️  Conflits: ${conflicts.length}`);
+    for (const p of professors) {
+      const slots = Object.values(profBusy[p._id.toString()] || {}).reduce((s,sl) => s+sl.length, 0);
+      profDist[`${p.name} ${p.prenom}`] = slots;
+      if (slots > 0) console.log(`   ${`${p.name} ${p.prenom}`.padEnd(30)}: ${slots} surveillance(s)`);
+    }
+
+    console.log(`\n✅ Planifiés : ${scheduledExams.length} / ${allModules.length}`);
+    console.log(`⚠️  Conflits  : ${conflicts.length}`);
 
     res.json({
       success: true,
       results: {
-        scheduled: scheduledExams,
+        scheduled:      scheduledExams,
         totalScheduled: scheduledExams.length,
         conflicts,
+        totalConflicts: conflicts.length,
         professorDistribution: profDist,
         period: {
-          normale: { start: '2025-01-01', end: '2025-01-07' },
-          rattrapage: { start: '2025-01-08', end: '2025-01-15' },
+          normale:    SESSION_CONFIG.normale,
+          rattrapage: SESSION_CONFIG.rattrapage,
         },
       },
     });
 
-  } catch (error) {
-    console.error('❌ Erreur autoGenerateSchedule:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ─── MANUAL SCHEDULE ─────────────────────────────────────────────────────────
-exports.scheduleExam = async (req, res) => {
-  try {
-    const { moduleId, date, heure_debut, heure_fin, salleId, superviseurIds } = req.body;
-
-    if (!moduleId || !date || !heure_debut || !heure_fin || !salleId || !superviseurIds?.length) {
-      return res.status(400).json({ success: false, message: 'Champs obligatoires manquants.' });
-    }
-
-    const [mod, room] = await Promise.all([Module.findById(moduleId), Room.findById(salleId)]);
-    if (!mod) return res.status(404).json({ success: false, message: 'Module introuvable.' });
-    if (!room) return res.status(404).json({ success: false, message: 'Salle introuvable.' });
-
-    const examDate = new Date(date);
-
-    // Conflict: room
-    const roomExams = await Exam.find({ salle: salleId, date: examDate });
-    const roomConflict = roomExams.find(e => hasOverlap(heure_debut, heure_fin, e.heure_debut, e.heure_fin));
-    if (roomConflict) return res.status(409).json({ success: false, message: `Salle ${room.nom} déjà occupée sur ce créneau.` });
-
-    // Conflict: prof
-    const profExams = await Exam.find({ surveillant: superviseurIds[0], date: examDate });
-    const profConflict = profExams.find(e => hasOverlap(heure_debut, heure_fin, e.heure_debut, e.heure_fin));
-    if (profConflict) return res.status(409).json({ success: false, message: 'Ce surveillant a déjà un examen sur ce créneau.' });
-
-    // Auto-assign students
-    const students = await User.find({ role: 'etudiant', departement: mod.department, niveau: mod.semester }).select('_id');
-    if (students.length > room.capacite) {
-      return res.status(400).json({ success: false, message: `Capacité insuffisante: salle ${room.nom} (${room.capacite}) < étudiants (${students.length})` });
-    }
-
-    const exam = new Exam({
-      module: mod.name,
-      code_module: mod.code,
-      date: examDate,
-      heure_debut,
-      heure_fin,
-      salle: salleId,
-      surveillant: superviseurIds[0],
-      surveillants_supplementaires: superviseurIds.slice(1),
-      etudiants: students.map(s => s._id),
-      nombre_etudiants: students.length || room.capacite,
-      department: mod.department,
-      semester: mod.semester,
-      session: 'normale',
-    });
-
-    await exam.save();
-    await exam.populate([
-      { path: 'salle', select: 'nom capacite' },
-      { path: 'surveillant', select: 'name prenom' },
-    ]);
-
-    res.json({ success: true, message: 'Examen planifié avec succès.', exam });
-  } catch (error) {
-    console.error('Erreur scheduleExam:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ─── CHECK AVAILABILITY ──────────────────────────────────────────────────────
-exports.checkAvailability = async (req, res) => {
-  try {
-    const { date, heure_debut, heure_fin, salleId, supervisorId } = req.body;
-    const result = { available: true, roomConflict: null, supervisorConflict: null };
-
-    if (salleId) {
-      const exams = await Exam.find({ salle: salleId, date: new Date(date) });
-      result.roomConflict = exams.find(e => hasOverlap(heure_debut, heure_fin, e.heure_debut, e.heure_fin)) || null;
-    }
-    if (supervisorId) {
-      const exams = await Exam.find({ surveillant: supervisorId, date: new Date(date) });
-      result.supervisorConflict = exams.find(e => hasOverlap(heure_debut, heure_fin, e.heure_debut, e.heure_fin)) || null;
-    }
-
-    result.available = !result.roomConflict && !result.supervisorConflict;
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ─── GET SCHEDULE ─────────────────────────────────────────────────────────────
-exports.getSchedule = async (req, res) => {
-  try {
-    const { session, department } = req.query;
-    const filter = {};
-    if (session) filter.session = session;
-    if (department) filter.department = department;
-
-    const exams = await Exam.find(filter)
-      .populate('salle', 'nom capacite batiment')
-      .populate('surveillant', 'name prenom email')
-      .sort({ date: 1, heure_debut: 1 });
-
-    res.json({ success: true, count: exams.length, exams });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+  } catch(err) {
+    console.error('autoGenerateSchedule ERROR:', err);
+    res.status(500).json({ success:false, message:err.message });
   }
 };

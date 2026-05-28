@@ -1,700 +1,371 @@
-import { generateStudentPDF, generateProfessorPDF, generateAdminPDF } from '../components/PDFExport';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useNavigate } from 'react-router-dom';
+import { generateStudentPDF, generateProfessorPDF, generateAdminPDF } from '../components/PDFExport';
 import API from '../services/api';
+
+const formatDate = (d) => d ? new Date(d).toLocaleDateString('fr-FR', { day:'2-digit', month:'short', year:'numeric' }) : '-';
+const formatTime = (t) => t ? t.substring(0, 5) : '-';
+
+const SESSION_BADGE = {
+  normale:    { bg:'#dbeafe', color:'#1e40af', label:'Normale' },
+  rattrapage: { bg:'#fef3c7', color:'#92400e', label:'Rattrapage' },
+};
+
+const ROOM_TYPE_LABEL = { amphi:'Amphi', grande_salle:'Grande Salle', petite_salle:'Petite Salle', labo:'Labo' };
+
+const btn = (active) => ({
+  padding:'8px 16px', borderRadius:'8px', border:'none',
+  background: active ? '#0f3b5f' : 'white',
+  color:       active ? 'white'   : '#475569',
+  fontWeight:'600', cursor:'pointer',
+});
 
 const Dashboard = () => {
   const { user, logout, isAdmin, isProfessor, isStudent } = useAuth();
   const navigate = useNavigate();
-  const [users, setUsers] = useState([]);
-  const [rooms, setRooms] = useState([]);
-  const [exams, setExams] = useState([]);
-  const [modules, setModules] = useState([]);
-  const [activeTab, setActiveTab] = useState('exams');
+  const [exams,   setExams]   = useState([]);
+  const [users,   setUsers]   = useState([]);
+  const [rooms,   setRooms]   = useState([]);
   const [loading, setLoading] = useState(true);
-  const [showForm, setShowForm] = useState(false);
-  const [formType, setFormType] = useState('');
-  const [formData, setFormData] = useState({});
-  const [message, setMessage] = useState('');
-  const [showStudentForm, setShowStudentForm] = useState(false);
-  const [showProfessorForm, setShowProfessorForm] = useState(false);
-  const [userFilter, setUserFilter] = useState('all');
+  const [activeTab, setActiveTab] = useState('exams');
+  const [msg, setMsg] = useState('');
+  const [generating, setGenerating] = useState(false);
 
-   // Debug - Afficher la structure des examens
-console.log('=== STRUCTURE DES EXAMENS ===');
-console.log('Exams:', exams);
-if (exams && exams[0]) {
-    console.log('Premier examen:', exams[0]);
-    console.log('Clés du premier examen:', Object.keys(exams[0]));
-    console.log('Etudiants du premier examen:', exams[0].etudiants);
-} 
-
-   const handleExportPDF = () => {
-    if (isStudent && user && exams) {
-      generateStudentPDF(user, exams);
-    } else if (isProfessor && user && exams) {
-      generateProfessorPDF(user, exams);
-    } else if (isAdmin && exams) {
-      generateAdminPDF(exams);
-    } else {
-      alert('No data to export');
-    }
+  const flash = (text, type='success') => {
+    setMsg({ text, type });
+    setTimeout(() => setMsg(''), 5000);
   };
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    try {
+      if (activeTab === 'exams') {
+        let endpoint = '/exams';
+        if (isStudent)   endpoint = '/exams/my-exams';
+        if (isProfessor) endpoint = '/exams/my-supervisions';
+        const res = await API.get(endpoint);
+        setExams(res.data.exams || []);
+      }
+      if (isAdmin) {
+        if (activeTab === 'professors') {
+          const res = await API.get('/auth/users');
+          setUsers((res.data || []).filter(u => u.role === 'professeur'));
+        }
+        if (activeTab === 'rooms') {
+          const res = await API.get('/rooms');
+          setRooms(res.data.rooms || []);
+        }
+      }
+    } catch (err) {
+      console.error(err);
+    }
+    setLoading(false);
+  }, [activeTab, isAdmin, isStudent, isProfessor]);
+
+  useEffect(() => { fetchData(); }, [fetchData]);
 
   useEffect(() => {
-    fetchData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab]);
+    if (isStudent)   setActiveTab('exams');
+    if (isProfessor) setActiveTab('exams');
+    if (isAdmin)     setActiveTab('schedule');
+  }, [isAdmin, isProfessor, isStudent]);
 
-  const fetchData = async () => {
-  setLoading(true);
-  try {
-    if (activeTab === 'exams') {
-      let endpoint = '/exams';
-      if (isStudent)   endpoint = '/exams/my-exams';        // filtered by dept+level
-      if (isProfessor) endpoint = '/exams/my-supervisions'; // filtered by surveillant
-      const res = await API.get(endpoint);
-      console.log('Exams fetched:', res.data.exams?.length);
-      setExams(res.data.exams || []);
-    }
-    else if (activeTab === 'rooms') {
-      const res = await API.get('/rooms');
-      setRooms(res.data.rooms || []);
-    } 
-    else if (activeTab === 'users') {
-      const res = await API.get('/auth/users');
-      setUsers(res.data);
-    } 
-    else if (activeTab === 'modules') {
-      const res = await API.get('/modules');
-      setModules(res.data.modules || []);
-    }
-    else if (activeTab === 'schedule') {
-      // Load all data needed for scheduling
-      const [modulesRes, roomsRes, usersRes, examsRes] = await Promise.all([
-        API.get('/modules'),
-        API.get('/rooms'),
-        API.get('/auth/users'),
-        API.get('/exams')
-      ]);
-      setModules(modulesRes.data.modules || []);
-      setRooms(roomsRes.data.rooms || []);
-      setUsers(usersRes.data);
-      setExams(examsRes.data.exams || []);
-      console.log('Loaded for schedule tab:');
-      console.log('  Modules:', modulesRes.data.modules?.length);
-      console.log('  Rooms:', roomsRes.data.rooms?.length);
-      console.log('  Professors:', usersRes.data.filter(u => u.role === 'professeur').length);
-      console.log('  Exams:', examsRes.data.exams?.length);
-    }
-  } catch (error) {
-    console.error('Error fetching data:', error);
-  }
-  setLoading(false);
-};
-  const handleLogout = () => {
-    logout();
-    navigate('/login');
+  const handleExportPDF = () => {
+    if (!exams.length) return flash('Aucun examen à exporter', 'error');
+    if (isStudent)        generateStudentPDF(user, exams);
+    else if (isProfessor) generateProfessorPDF(user, exams);
+    else                  generateAdminPDF(exams);
   };
 
-  const getRoleBadge = (role) => {
-    const roleClass = {
-      admin: 'role-admin',
-      professeur: 'role-professeur',
-      etudiant: 'role-etudiant'
-    };
-    const roleName = {
-      admin: 'Admin',
-      professeur: 'Professor',
-      etudiant: 'Student'
-    };
-    return (
-      <span className={`role-badge ${roleClass[role]}`}>
-        {roleName[role]}
-      </span>
-    );
-  };
-
-  const getDepartmentColor = (dept) => {
-    return dept === 'GI' ? 'bg-blue-100 text-blue-800' : 'bg-green-100 text-green-800';
-  };
-
-  const handleCreateStudent = async (e) => {
-    e.preventDefault();
-    setLoading(true);
+  const handleAutoGenerate = async () => {
+    setGenerating(true);
     try {
-      const response = await API.post('/auth/admin/create-user', {
-        ...formData,
-        role: 'etudiant'
-      });
-      if (response.data.message) {
-        setMessage({ type: 'success', text: response.data.message });
-        setShowStudentForm(false);
-        setFormData({});
-        fetchData();
-        setTimeout(() => setMessage(''), 3000);
-      }
-    } catch (error) {
-      setMessage({ type: 'error', text: error.response?.data?.message || 'Error creating student' });
+      const res = await API.post('/scheduling/auto-generate');
+      const r   = res.data.results;
+      flash(`${r?.totalScheduled || 0} examens générés (${r?.totalConflicts || 0} conflits)`);
+      setActiveTab('exams');
+      fetchData();
+    } catch (err) {
+      flash(err.response?.data?.message || 'Erreur génération', 'error');
     }
-    setLoading(false);
+    setGenerating(false);
   };
 
-  const handleCreateProfessor = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      const response = await API.post('/auth/admin/create-user', {
-        ...formData,
-        role: 'professeur'
-      });
-      if (response.data.message) {
-        setMessage({ type: 'success', text: response.data.message });
-        setShowProfessorForm(false);
-        setFormData({});
-        fetchData();
-        setTimeout(() => setMessage(''), 3000);
-      }
-    } catch (error) {
-      setMessage({ type: 'error', text: error.response?.data?.message || 'Error creating professor' });
-    }
-    setLoading(false);
-  };
+  // ── render helpers ──────────────────────────────────────────────────────────
 
-  const handleCreateModule = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      const response = await API.post('/modules', formData);
-      if (response.data.success) {
-        setMessage({ type: 'success', text: 'Module created successfully!' });
-        setShowForm(false);
-        setFormData({});
-        fetchData();
-        setTimeout(() => setMessage(''), 3000);
-      }
-    } catch (error) {
-      setMessage({ type: 'error', text: error.response?.data?.message || 'Error creating module' });
-    }
-    setLoading(false);
-  };
+  const ExamTable = ({ rows, showSurveillants = false, showSession = false, showDept = false }) => (
+    <div style={{ background:'white', borderRadius:'12px', overflow:'auto', boxShadow:'0 1px 4px rgba(0,0,0,0.08)' }}>
+      <table style={{ width:'100%', borderCollapse:'collapse', minWidth:'800px' }}>
+        <thead>
+          <tr style={{ background:'#0f3b5f', color:'white' }}>
+            <th style={{ padding:'12px', textAlign:'left' }}>Module</th>
+            {showDept    && <th style={{ padding:'12px', textAlign:'left' }}>Dépt / Sem.</th>}
+            {showSession && <th style={{ padding:'12px', textAlign:'left' }}>Session</th>}
+            <th style={{ padding:'12px', textAlign:'left' }}>Date</th>
+            <th style={{ padding:'12px', textAlign:'left' }}>Horaire</th>
+            <th style={{ padding:'12px', textAlign:'left' }}>Salle</th>
+            <th style={{ padding:'12px', textAlign:'left' }}>
+              {showSurveillants ? 'Surveillant(s)' : 'Surveillant'}
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((exam, idx) => {
+            const sb = SESSION_BADGE[exam.session] || SESSION_BADGE['normale'];
+            return (
+              <tr key={exam._id || idx} style={{ borderTop:'1px solid #e2e8f0', background: idx%2===0 ? 'white' : '#f8fafc' }}>
+                <td style={{ padding:'12px' }}>
+                  <div style={{ fontWeight:'700', color:'#0f3b5f' }}>{exam.module}</div>
+                  <div style={{ fontSize:'11px', color:'#94a3b8' }}>{exam.code_module}</div>
+                </td>
+                {showDept && (
+                  <td style={{ padding:'12px' }}>
+                    <span style={{ background:'#e0f2fe', color:'#0369a1', borderRadius:'12px', padding:'2px 8px', fontSize:'12px', fontWeight:'600' }}>
+                      {exam.department}
+                    </span>
+                    <div style={{ fontSize:'11px', color:'#94a3b8', marginTop:'2px' }}>{exam.semester}</div>
+                  </td>
+                )}
+                {showSession && (
+                  <td style={{ padding:'12px' }}>
+                    <span style={{ background:sb.bg, color:sb.color, borderRadius:'12px', padding:'2px 8px', fontSize:'12px', fontWeight:'600' }}>
+                      {sb.label}
+                    </span>
+                  </td>
+                )}
+                <td style={{ padding:'12px', whiteSpace:'nowrap' }}>{formatDate(exam.date)}</td>
+                <td style={{ padding:'12px', whiteSpace:'nowrap', fontWeight:'600' }}>
+                  {formatTime(exam.heure_debut)} – {formatTime(exam.heure_fin)}
+                </td>
+                <td style={{ padding:'12px' }}>
+                  <div style={{ fontWeight:'600' }}>{exam.salle?.nom || '-'}</div>
+                  <div style={{ fontSize:'11px', color:'#94a3b8' }}>
+                    {ROOM_TYPE_LABEL[exam.salle?.type] || exam.salle?.type || ''}
+                    {exam.salle?.capacite ? ` · ${exam.salle.capacite} places` : ''}
+                  </div>
+                </td>
+                <td style={{ padding:'12px' }}>
+                  <div>{exam.surveillant?.name} {exam.surveillant?.prenom}</div>
+                  {showSurveillants && exam.surveillants?.length > 1 && (
+                    <div style={{ fontSize:'11px', color:'#64748b' }}>
+                      +{exam.surveillants.length - 1} co-surveillant(s)
+                    </div>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
 
-  const handleCreateRoom = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    try {
-      const response = await API.post('/rooms', formData);
-      if (response.data.success) {
-        setMessage({ type: 'success', text: 'Room created successfully!' });
-        setShowForm(false);
-        setFormData({});
-        fetchData();
-        setTimeout(() => setMessage(''), 3000);
-      }
-    } catch (error) {
-      setMessage({ type: 'error', text: error.response?.data?.message || 'Error creating room' });
-    }
-    setLoading(false);
-  };
-
-  const renderForm = () => {
-    if (formType === 'module') {
-      return (
-        <form onSubmit={handleCreateModule} className="bg-gray-50 p-4 rounded-lg mb-4">
-          <h3 className="font-bold mb-3">Create New Module</h3>
-          <div className="grid grid-cols-2 gap-3">
-            <input type="text" placeholder="Module Name" value={formData.name || ''} onChange={(e) => setFormData({ ...formData, name: e.target.value })} className="border p-2 rounded" required />
-            <input type="text" placeholder="Module Code (e.g., GI301)" value={formData.code || ''} onChange={(e) => setFormData({ ...formData, code: e.target.value })} className="border p-2 rounded" required />
-            <select value={formData.department || ''} onChange={(e) => setFormData({ ...formData, department: e.target.value })} className="border p-2 rounded" required>
-              <option value="">Select Department</option>
-              <option value="GI">GI - Génie Informatique</option>
-              <option value="IDS">IDS - Informatique Décisionnelle</option>
-            </select>
-            <select value={formData.semester || ''} onChange={(e) => setFormData({ ...formData, semester: e.target.value })} className="border p-2 rounded" required>
-              <option value="">Select Semester</option>
-              <option value="S1">Semester 1</option>
-              <option value="S2">Semester 2</option>
-              <option value="S3">Semester 3</option>
-              <option value="S4">Semester 4</option>
-              <option value="S5">Semester 5</option>
-              <option value="S6">Semester 6</option>
-            </select>
-            <select value={formData.professor || ''} onChange={(e) => setFormData({ ...formData, professor: e.target.value })} className="border p-2 rounded" required>
-              <option value="">Select Professor</option>
-              {users.filter(u => u.role === 'professeur').map(p => (
-                <option key={p._id} value={p._id}>{p.name} {p.prenom} - {p.specialization}</option>
-              ))}
-            </select>
-            <input type="number" placeholder="Credits" value={formData.credits || ''} onChange={(e) => setFormData({ ...formData, credits: e.target.value })} className="border p-2 rounded" />
-            <input type="number" placeholder="Hours" value={formData.hours || ''} onChange={(e) => setFormData({ ...formData, hours: e.target.value })} className="border p-2 rounded" />
-          </div>
-          <div className="mt-3 flex gap-2">
-            <button type="submit" className="bg-green-600 text-white px-4 py-2 rounded">Create Module</button>
-          </div>
-        </form>
-      );
-    }
-    if (formType === 'room') {
-      return (
-        <form onSubmit={handleCreateRoom} className="bg-gray-50 p-4 rounded-lg mb-4">
-          <h3 className="font-bold mb-3">Create New Room</h3>
-          <div className="grid grid-cols-2 gap-3">
-            <input type="text" placeholder="Room Name (e.g., GI101)" value={formData.nom || ''} onChange={(e) => setFormData({ ...formData, nom: e.target.value })} className="border p-2 rounded" required />
-            <input type="number" placeholder="Capacity" value={formData.capacite || ''} onChange={(e) => setFormData({ ...formData, capacite: e.target.value })} className="border p-2 rounded" required />
-            <input type="text" placeholder="Building" value={formData.batiment || ''} onChange={(e) => setFormData({ ...formData, batiment: e.target.value })} className="border p-2 rounded" required />
-            <input type="number" placeholder="Floor" value={formData.etage || ''} onChange={(e) => setFormData({ ...formData, etage: e.target.value })} className="border p-2 rounded" required />
-            <input type="text" placeholder="Equipment (comma separated)" value={formData.equipment || ''} onChange={(e) => setFormData({ ...formData, equipment: e.target.value.split(',') })} className="border p-2 rounded" />
-          </div>
-          <div className="mt-3 flex gap-2">
-            <button type="submit" className="bg-green-600 text-white px-4 py-2 rounded">Create Room</button>
-          </div>
-        </form>
-      );
-    }
-    return null;
-  };
-
+  // ── main render ─────────────────────────────────────────────────────────────
   return (
-    <div className="dashboard-container">
-      <nav className="navbar">
-        <div className="navbar-content">
-          <div className="navbar-title">🏫 University of Soultan Moulay Slimane - Higher School of Technology Fquih Ben Salah</div>
-          <div className="user-info">
-            <div className="user-details">
-              <div className="user-name">{user?.name} {user?.prenom}</div>
-              <div className="user-role">{getRoleBadge(user?.role)}</div>
+    <div style={{ minHeight:'100vh', background:'#f1f5f9' }}>
+
+      {/* Nav */}
+      <nav style={{ background:'#0f3b5f', color:'white', padding:'12px 24px', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+        <div style={{ fontWeight:'bold', fontSize:'14px' }}>🏫 EST Fquih Ben Salah – Gestion des Examens</div>
+        <div style={{ display:'flex', alignItems:'center', gap:'12px' }}>
+          <div style={{ textAlign:'right' }}>
+            <div style={{ fontWeight:'600', fontSize:'14px' }}>{user?.name} {user?.prenom}</div>
+            <div style={{ fontSize:'12px', opacity:0.8 }}>
+              {user?.role === 'admin' ? '👑 Admin' : user?.role === 'professeur' ? '👨‍🏫 Professeur' : '🎓 Étudiant'}
             </div>
-            <button onClick={handleLogout} className="logout-btn">Logout</button>
           </div>
+          <button onClick={() => { logout(); navigate('/login'); }}
+            style={{ background:'#dc2626', color:'white', border:'none', padding:'6px 14px', borderRadius:'6px', cursor:'pointer' }}>
+            Déconnexion
+          </button>
         </div>
       </nav>
 
-      <div className="main-content">
-        <div className="welcome-card">
-          <h2 className="welcome-title">Welcome, {user?.name} {user?.prenom}!</h2>
-          <p className="welcome-text">
-            {isAdmin && "You have full access to manage users, rooms, exams, and modules across all departments."}
-            {isProfessor && `You are teaching in the ${user?.specialization || 'Computer Science'} department.`}
-            {isStudent && `You are a ${user?.niveau || ''} student in ${user?.departement === 'GI' ? 'Computer Engineering' : 'Decision Support Systems'} department.`}
+      <div style={{ maxWidth:'1280px', margin:'0 auto', padding:'20px' }}>
+
+        {/* Welcome */}
+        <div style={{ background:'white', borderRadius:'12px', padding:'20px', marginBottom:'20px', borderLeft:'5px solid #0f3b5f' }}>
+          <h2 style={{ margin:0, fontSize:'20px', color:'#0f3b5f' }}>Bienvenue, {user?.prenom} {user?.name} !</h2>
+          <p style={{ margin:'6px 0 0', color:'#64748b', fontSize:'14px' }}>
+            {isAdmin     && '👑 Accès administrateur – planification, salles, professeurs.'}
+            {isProfessor && `👨‍🏫 Spécialisation : ${user?.specialization || '-'} — Consultez vos surveillances.`}
+            {isStudent   && `🎓 ${user?.departement || '-'} – ${user?.niveau || '-'} — Consultez votre calendrier d'examens.`}
           </p>
         </div>
 
-        {message && (
-          <div className={`mb-4 p-3 rounded ${message.type === 'success' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-            {message.text}
+        {/* Flash */}
+        {msg && (
+          <div style={{ padding:'12px', borderRadius:'8px', marginBottom:'16px',
+            background: msg.type==='error' ? '#fee2e2' : '#d1fae5',
+            color:       msg.type==='error' ? '#dc2626' : '#065f46' }}>
+            {msg.text}
           </div>
         )}
 
-        <div className="tabs-container">
-          <div className="tabs-header">
-            <button onClick={() => setActiveTab('schedule')} className={`tab-btn ${activeTab === 'schedule' ? 'active' : 'inactive'}`}>
-              📅 Schedule Exams
+        {/* Tabs */}
+        <div style={{ display:'flex', gap:'8px', flexWrap:'wrap', marginBottom:'20px', borderBottom:'1px solid #e2e8f0', paddingBottom:'10px' }}>
+          {isProfessor && (
+            <button onClick={() => setActiveTab('exams')} style={btn(activeTab==='exams')}>
+              📝 Mes Surveillances
             </button>
-            <button onClick={() => setActiveTab('exams')} className={`tab-btn ${activeTab === 'exams' ? 'active' : 'inactive'}`}>📝 Exams</button>
-            {/* PDF EXPORT BUTTON */}
-  <button 
-        onClick={handleExportPDF} 
-        className="tab-btn" 
-        style={{ background: '#dc2626', color: 'white', marginLeft: 'auto' }}
-      >
-        📄 Export PDF
-      </button>
-            {isAdmin && (
-              <>
-                <button onClick={() => setActiveTab('users')} className={`tab-btn ${activeTab === 'users' ? 'active' : 'inactive'}`}>👥 Users</button>
-                <button onClick={() => setActiveTab('rooms')} className={`tab-btn ${activeTab === 'rooms' ? 'active' : 'inactive'}`}>🏫 Rooms</button>
-                <button onClick={() => setActiveTab('modules')} className={`tab-btn ${activeTab === 'modules' ? 'active' : 'inactive'}`}>📚 Modules</button>
-                <button onClick={() => setActiveTab('studentsBySemester')} className={`tab-btn ${activeTab === 'studentsBySemester' ? 'active' : 'inactive'}`}>🎓 Students by Semester</button>
-              </>
-            )}
-          </div>
+          )}
+          {isStudent && (
+            <button onClick={() => setActiveTab('exams')} style={btn(activeTab==='exams')}>
+              📝 Mes Examens
+            </button>
+          )}
+          {isAdmin && (
+            <>
+              <button onClick={() => setActiveTab('schedule')}    style={btn(activeTab==='schedule')}>📅 Planification</button>
+              <button onClick={() => setActiveTab('exams')}       style={btn(activeTab==='exams')}>📝 Calendrier Examens</button>
+              <button onClick={() => setActiveTab('rooms')}       style={btn(activeTab==='rooms')}>🏫 Salles</button>
+              <button onClick={() => setActiveTab('professors')}  style={btn(activeTab==='professors')}>👨‍🏫 Professeurs</button>
+            </>
+          )}
+          {exams.length > 0 && (
+            <button onClick={handleExportPDF}
+              style={{ marginLeft:'auto', background:'#dc2626', color:'white', border:'none', padding:'8px 16px', borderRadius:'8px', cursor:'pointer', fontWeight:'600' }}>
+              📄 Exporter PDF
+            </button>
+          )}
+        </div>
 
-          <div className="tab-content">
+        {loading ? (
+          <div style={{ textAlign:'center', padding:'60px', color:'#94a3b8' }}>⏳ Chargement...</div>
+        ) : (
+          <>
+
+            {/* ── EXAMS TAB ── */}
+            {activeTab === 'exams' && (
+              <div>
+                {exams.length === 0 ? (
+                  <div style={{ textAlign:'center', padding:'60px', background:'white', borderRadius:'12px' }}>
+                    <div style={{ fontSize:'48px', marginBottom:'12px' }}>
+                      {isProfessor ? '👨‍🏫' : isStudent ? '🎓' : '📅'}
+                    </div>
+                    <div style={{ fontSize:'18px', fontWeight:'700', color:'#0f3b5f', marginBottom:'8px' }}>
+                      {isProfessor ? 'Aucune surveillance assignée' : isStudent ? 'Aucun examen planifié pour vous' : 'Aucun examen planifié'}
+                    </div>
+                    <div style={{ color:'#94a3b8', fontSize:'14px' }}>
+                      {isAdmin ? 'Utilisez l\'onglet "Planification" pour générer les examens.' : 'Les examens apparaîtront ici une fois la planification effectuée.'}
+                    </div>
+                    {isAdmin && (
+                      <button onClick={handleAutoGenerate} disabled={generating}
+                        style={{ marginTop:'16px', background:'#059669', color:'white', border:'none', padding:'10px 24px', borderRadius:'8px', cursor:'pointer', fontWeight:'600' }}>
+                        {generating ? '⏳ Génération...' : '🤖 Générer les examens'}
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    <div style={{ marginBottom:'12px', color:'#64748b', fontSize:'14px' }}>
+                      {exams.length} examen(s) trouvé(s)
+                      {isStudent && ` · ${user?.departement} ${user?.niveau}`}
+                    </div>
+                    <ExamTable
+                      rows={exams}
+                      showSurveillants={isAdmin || isProfessor}
+                      showSession={true}
+                      showDept={isAdmin}
+                    />
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* ── SCHEDULE TAB (Admin) ── */}
             {activeTab === 'schedule' && isAdmin && (
-  <div>
-    <div className="bg-blue-50 p-4 rounded-lg mb-4">
-      <h3 className="font-bold text-lg mb-2">🤖 Auto-Generate Schedule</h3>
-      <p className="text-sm text-gray-600 mb-3">Generate complete exam schedule for all departments (Principal exams: 1-15 Jan, Rattrapage: 16-30 Jan)</p>
-      <button
-        onClick={async () => {
-          setLoading(true);
-          try {
-            const response = await API.post('/scheduling/auto-generate', { year: 2025, month: 1 });
-alert(`✅ Scheduled ${response.data.results.scheduled.length} exams successfully!`);
-
-fetchData();
-          } catch (error) {
-            alert('Error: ' + error.response?.data?.message);
-          }
-          setLoading(false);
-        }}
-        className="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700"
-      >
-        🤖 Generate All Exams
-      </button>
-    </div>
-
-    <div className="mt-6">
-      <h3 className="font-bold text-lg mb-3">📝 Manual Exam Scheduling</h3>
-      <form onSubmit={async (e) => {
-        e.preventDefault();
-        setLoading(true);
-        try {
-          const response = await API.post('/scheduling/manual', formData);
-          alert('✅ Exam scheduled successfully!');
-          setShowForm(false);
-          fetchData();
-        } catch (error) {
-          alert('❌ ' + error.response?.data?.message);
-        }
-        setLoading(false);
-      }} className="bg-gray-50 p-4 rounded-lg">
-        
-        {/* 🔍 DEBUG INFO - Shows what data is loaded */}
-        <div className="text-xs text-gray-500 mb-2 p-2 bg-gray-100 rounded">
-          📊 Data loaded: 
-          Modules: {modules.length} | 
-          Rooms: {rooms.length} | 
-          Professors: {users.filter(u => u.role === 'professeur').length}
-        </div>
-        
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="block text-sm font-medium mb-1">Select Module</label>
-            <select 
-              value={formData.moduleId || ''} 
-              onChange={(e) => setFormData({...formData, moduleId: e.target.value})}
-              className="border p-2 rounded w-full"
-              required
-            >
-              <option value="">-- Select Module --</option>
-              {modules.map(m => (
-                <option key={m._id} value={m._id}>{m.code} - {m.name} ({m.department})</option>
-              ))}
-            </select>
-          </div>
-          
-          <div>
-            <label className="block text-sm font-medium mb-1">Date</label>
-            <input 
-              type="date" 
-              value={formData.date || ''} 
-              onChange={(e) => setFormData({...formData, date: e.target.value})}
-              className="border p-2 rounded w-full"
-              required
-            />
-          </div>
-          
-          <div>
-            <label className="block text-sm font-medium mb-1">Start Time</label>
-            <select 
-              value={formData.heure_debut || ''} 
-              onChange={(e) => setFormData({...formData, heure_debut: e.target.value})}
-              className="border p-2 rounded w-full"
-              required
-            >
-              <option value="">-- Select Time --</option>
-              <option value="08:00">08:00</option>
-              <option value="10:30">10:30</option>
-              <option value="14:00">14:00</option>
-              <option value="16:30">16:30</option>
-            </select>
-          </div>
-          
-          <div>
-            <label className="block text-sm font-medium mb-1">End Time</label>
-            <select 
-              value={formData.heure_fin || ''} 
-              onChange={(e) => setFormData({...formData, heure_fin: e.target.value})}
-              className="border p-2 rounded w-full"
-              required
-            >
-              <option value="">-- Select Time --</option>
-              <option value="10:00">10:00</option>
-              <option value="12:30">12:30</option>
-              <option value="16:00">16:00</option>
-              <option value="18:30">18:30</option>
-            </select>
-          </div>
-          
-          <div>
-            <label className="block text-sm font-medium mb-1">Select Room</label>
-            <select 
-              value={formData.salleId || ''} 
-              onChange={(e) => setFormData({...formData, salleId: e.target.value})}
-              className="border p-2 rounded w-full"
-              required
-            >
-              <option value="">-- Select Room --</option>
-              {rooms.map(r => (
-                <option key={r._id} value={r._id}>{r.nom} (Capacity: {r.capacite})</option>
-              ))}
-            </select>
-          </div>
-          
-          <div>
-            <label className="block text-sm font-medium mb-1">Select Supervisors (Hold Ctrl to select multiple)</label>
-            <select 
-              multiple 
-              value={formData.superviseurIds || []} 
-              onChange={(e) => {
-                const selected = Array.from(e.target.selectedOptions, option => option.value);
-                setFormData({...formData, superviseurIds: selected});
-              }}
-              className="border p-2 rounded w-full h-24"
-              required
-            >
-              {users.filter(u => u.role === 'professeur').map(p => (
-                <option key={p._id} value={p._id}>{p.name} {p.prenom} - {p.specialization}</option>
-              ))}
-            </select>
-            <p className="text-xs text-gray-500 mt-1">Hold Ctrl (or Cmd on Mac) to select multiple supervisors</p>
-          </div>
-        </div>
-        
-        <div className="mt-4">
-          <button type="submit" className="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700">
-            Schedule Exam
-          </button>
-        </div>
-      </form>
-    </div>
-    
-    <div className="mt-8">
-      <h3 className="font-bold text-lg mb-3">📅 Scheduled Exams</h3>
-      <div className="table-container">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Module</th>
-              <th>Department</th>
-              <th>Date</th>
-              <th>Time</th>
-              <th>Room</th>
-              <th>Supervisors</th>
-            </tr>
-          </thead>
-          <tbody>
-            {exams.map(exam => (
-              <tr key={exam._id}>
-                <td>{exam.module}</td>
-                <td>{exam.code_module?.includes('GI') ? 'GI' : exam.code_module?.includes('IDS') ? 'IDS' : 'COMMON'}</td>
-                <td>{new Date(exam.date).toLocaleDateString()}</td>
-                <td>{exam.heure_debut} - {exam.heure_fin}</td>
-                <td>{exam.salle?.nom}</td>
-                <td>{exam.surveillant?.name} {exam.surveillant?.prenom}</td>
-              </tr>
-            ))}
-            {exams.length === 0 && (
-              <tr>
-                <td colSpan="6" style={{ textAlign: 'center', padding: '40px' }}>
-                  No exams scheduled yet. Click "Generate All Exams" or use manual scheduling.
-                </td>
-              </tr>
+              <div style={{ maxWidth:'600px' }}>
+                <div style={{ background:'white', borderRadius:'12px', padding:'28px' }}>
+                  <h3 style={{ margin:'0 0 6px', color:'#0f3b5f' }}>🤖 Génération automatique du planning</h3>
+                  <p style={{ margin:'0 0 20px', color:'#64748b', fontSize:'14px', lineHeight:'1.5' }}>
+                    Génère l'intégralité du calendrier d'examens selon les règles suivantes :
+                  </p>
+                  <ul style={{ color:'#475569', fontSize:'14px', lineHeight:'1.8', paddingLeft:'20px', marginBottom:'20px' }}>
+                    <li><strong>Session normale</strong> : 01 – 07 juin 2026 · Semestres S1, S3, S5</li>
+                    <li><strong>Session rattrapage</strong> : 08 – 15 juin 2026 · Semestres S2, S4, S6</li>
+                    <li>4 créneaux / jour : 08h–10h, 10h30–12h30, 14h–16h, 16h30–18h30</li>
+                    <li>Max 2 examens / jour / étudiant, sans chevauchement</li>
+                    <li>Max 2 surveillances / jour / professeur</li>
+                    <li>Attribution de salle selon l'effectif (Amphi ≥ 3 surv., Grande ≥ 2, Petite ≥ 1)</li>
+                  </ul>
+                  <button onClick={handleAutoGenerate} disabled={generating}
+                    style={{ background: generating ? '#94a3b8' : '#059669', color:'white', border:'none', padding:'12px 28px', borderRadius:'8px', cursor: generating ? 'not-allowed' : 'pointer', fontWeight:'600', fontSize:'15px' }}>
+                    {generating ? '⏳ Génération en cours...' : '🤖 Lancer la génération'}
+                  </button>
+                  {generating && (
+                    <p style={{ marginTop:'12px', color:'#64748b', fontSize:'13px' }}>
+                      Patientez — cette opération peut prendre quelques secondes.
+                    </p>
+                  )}
+                </div>
+              </div>
             )}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-)}
 
-            {loading ? (
-              <div className="loading"><div className="spinner"></div><p>Loading...</p></div>
-            ) : (
-              <>
-                {activeTab === 'users' && isAdmin && (
-                  <div>
-                    <div className="flex gap-3 mb-4">
-                      <button onClick={() => { setShowStudentForm(!showStudentForm); setShowProfessorForm(false); setFormData({}); }} className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 flex items-center gap-2">🎓 + Add Student</button>
-                      <button onClick={() => { setShowProfessorForm(!showProfessorForm); setShowStudentForm(false); setFormData({}); }} className="bg-purple-600 text-white px-4 py-2 rounded hover:bg-purple-700 flex items-center gap-2">👨‍🏫 + Add Professor</button>
-                    </div>
-
-                    <div className="flex gap-2 mb-4 flex-wrap">
-                      <button onClick={() => setUserFilter('all')} className={`px-3 py-1 rounded text-sm ${userFilter === 'all' ? 'bg-gray-800 text-white' : 'bg-gray-200 text-gray-700'}`}>📊 All Users ({users.length})</button>
-                      <button onClick={() => setUserFilter('professors')} className={`px-3 py-1 rounded text-sm ${userFilter === 'professors' ? 'bg-purple-600 text-white' : 'bg-gray-200 text-gray-700'}`}>👨‍🏫 Professors ({users.filter(u => u.role === 'professeur').length})</button>
-                      <button onClick={() => setUserFilter('students')} className={`px-3 py-1 rounded text-sm ${userFilter === 'students' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}>🎓 Students ({users.filter(u => u.role === 'etudiant').length})</button>
-                      <button onClick={() => setUserFilter('admins')} className={`px-3 py-1 rounded text-sm ${userFilter === 'admins' ? 'bg-red-600 text-white' : 'bg-gray-200 text-gray-700'}`}>👑 Admins ({users.filter(u => u.role === 'admin').length})</button>
-                    </div>
-
-                    {showStudentForm && (
-                      <form onSubmit={handleCreateStudent} className="bg-blue-50 p-4 rounded-lg mb-4 border border-blue-200">
-                        <h3 className="font-bold text-lg mb-3 text-blue-800">🎓 Create New Student</h3>
-                        <div className="grid grid-cols-2 gap-3">
-                          <input type="text" placeholder="First Name" value={formData.name || ''} onChange={(e) => setFormData({ ...formData, name: e.target.value })} className="border p-2 rounded" required />
-                          <input type="text" placeholder="Last Name" value={formData.prenom || ''} onChange={(e) => setFormData({ ...formData, prenom: e.target.value })} className="border p-2 rounded" required />
-                          <input type="email" placeholder="Email" value={formData.email || ''} onChange={(e) => setFormData({ ...formData, email: e.target.value })} className="border p-2 rounded" required />
-                          <input type="text" placeholder="Student ID (e.g., GI2024001)" value={formData.numero_etudiant || ''} onChange={(e) => setFormData({ ...formData, numero_etudiant: e.target.value })} className="border p-2 rounded" required />
-                          <select value={formData.departement || ''} onChange={(e) => setFormData({ ...formData, departement: e.target.value })} className="border p-2 rounded" required>
-                            <option value="">Select Department</option>
-                            <option value="GI">GI - Génie Informatique</option>
-                            <option value="IDS">IDS - Informatique Décisionnelle</option>
-                          </select>
-                          <select value={formData.niveau || ''} onChange={(e) => setFormData({ ...formData, niveau: e.target.value })} className="border p-2 rounded" required>
-                            <option value="">Select Level</option>
-                            <option value="S1">S1</option><option value="S2">S2</option><option value="S3">S3</option>
-                            <option value="S4">S4</option><option value="S5">S5</option><option value="S6">S6</option>
-                          </select>
-                          <input type="password" placeholder="Password" value={formData.password || 'student123'} onChange={(e) => setFormData({ ...formData, password: e.target.value })} className="border p-2 rounded" required />
+            {/* ── ROOMS TAB (Admin) ── */}
+            {activeTab === 'rooms' && isAdmin && (
+              <div>
+                <div style={{ marginBottom:'12px', color:'#64748b', fontSize:'14px' }}>{rooms.length} salle(s)</div>
+                <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(220px, 1fr))', gap:'12px' }}>
+                  {rooms.map(r => {
+                    const typeColors = {
+                      amphi:        { bg:'#ede9fe', color:'#5b21b6' },
+                      grande_salle: { bg:'#dbeafe', color:'#1e40af' },
+                      petite_salle: { bg:'#d1fae5', color:'#065f46' },
+                      labo:         { bg:'#fef9c3', color:'#854d0e' },
+                    };
+                    const tc = typeColors[r.type] || { bg:'#f1f5f9', color:'#475569' };
+                    const surv = { amphi:3, grande_salle:2, petite_salle:1, labo:1 }[r.type] || 1;
+                    return (
+                      <div key={r._id} style={{ background:'white', borderRadius:'10px', padding:'16px', boxShadow:'0 1px 3px rgba(0,0,0,0.06)' }}>
+                        <div style={{ fontWeight:'700', fontSize:'16px', color:'#0f3b5f' }}>{r.nom}</div>
+                        <div style={{ fontSize:'12px', color:'#94a3b8', marginBottom:'10px' }}>Bât. {r.batiment} – Étage {r.etage}</div>
+                        <div style={{ display:'flex', gap:'6px', flexWrap:'wrap' }}>
+                          <span style={{ background:tc.bg, color:tc.color, padding:'2px 10px', borderRadius:'20px', fontSize:'12px', fontWeight:'600' }}>
+                            {ROOM_TYPE_LABEL[r.type] || r.type || '?'}
+                          </span>
+                          <span style={{ background:'#f1f5f9', color:'#475569', padding:'2px 10px', borderRadius:'20px', fontSize:'12px' }}>
+                            {r.capacite} places
+                          </span>
+                          <span style={{ background:'#f0fdf4', color:'#166534', padding:'2px 10px', borderRadius:'20px', fontSize:'12px' }}>
+                            {surv} surv.
+                          </span>
                         </div>
-                        <div className="mt-3 flex gap-2">
-                          <button type="submit" className="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700">Create Student</button>
-                          <button type="button" onClick={() => setShowStudentForm(false)} className="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600">Cancel</button>
-                        </div>
-                      </form>
-                    )}
-
-                    {showProfessorForm && (
-                      <form onSubmit={handleCreateProfessor} className="bg-purple-50 p-4 rounded-lg mb-4 border border-purple-200">
-                        <h3 className="font-bold text-lg mb-3 text-purple-800">👨‍🏫 Create New Professor</h3>
-                        <div className="grid grid-cols-2 gap-3">
-                          <input type="text" placeholder="First Name" value={formData.name || ''} onChange={(e) => setFormData({ ...formData, name: e.target.value })} className="border p-2 rounded" required />
-                          <input type="text" placeholder="Last Name" value={formData.prenom || ''} onChange={(e) => setFormData({ ...formData, prenom: e.target.value })} className="border p-2 rounded" required />
-                          <input type="email" placeholder="Email" value={formData.email || ''} onChange={(e) => setFormData({ ...formData, email: e.target.value })} className="border p-2 rounded" required />
-                          <input type="text" placeholder="Specialization" value={formData.specialization || ''} onChange={(e) => setFormData({ ...formData, specialization: e.target.value })} className="border p-2 rounded" required />
-                          <input type="password" placeholder="Password" value={formData.password || 'prof123'} onChange={(e) => setFormData({ ...formData, password: e.target.value })} className="border p-2 rounded" required />
-                        </div>
-                        <div className="mt-3 flex gap-2">
-                          <button type="submit" className="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700">Create Professor</button>
-                          <button type="button" onClick={() => setShowProfessorForm(false)} className="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600">Cancel</button>
-                        </div>
-                      </form>
-                    )}
-
-                    <div className="table-container">
-                      <table className="data-table">
-                        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Department/ID</th><th>Specialization/Level</th></tr></thead>
-                        <tbody>
-                          {users.filter(u => {
-                            if (userFilter === 'professors') return u.role === 'professeur';
-                            if (userFilter === 'students') return u.role === 'etudiant';
-                            if (userFilter === 'admins') return u.role === 'admin';
-                            return true;
-                          }).map((u) => (
-                            <tr key={u._id}>
-                              <td>{u.name} {u.prenom}</td>
-                              <td>{u.email}</td>
-                              <td>{getRoleBadge(u.role)}</td>
-                              <td>{u.role === 'etudiant' ? `${u.departement || '-'} / ${u.numero_etudiant || '-'}` : '-'}</td>
-                              <td>{u.role === 'professeur' ? <span className="text-purple-600 font-medium">{u.specialization || '-'}</span> : u.role === 'etudiant' ? <span className="text-blue-600">{u.niveau || '-'}</span> : 'System Administrator'}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                    <div className="mt-2 text-gray-600">
-                      {userFilter === 'all' && `Total Users: ${users.length}`}
-                      {userFilter === 'professors' && `Total Professors: ${users.filter(u => u.role === 'professeur').length}`}
-                      {userFilter === 'students' && `Total Students: ${users.filter(u => u.role === 'etudiant').length}`}
-                      {userFilter === 'admins' && `Total Admins: ${users.filter(u => u.role === 'admin').length}`}
-                    </div>
-                  </div>
-                )}
-
-                {activeTab === 'rooms' && (
-                  <div>
-                    <div className="flex justify-between items-center mb-4">
-                      <h3 className="text-lg font-semibold">All Rooms</h3>
-                      <button onClick={() => { setFormType('room'); setShowForm(!showForm); setFormData({}); }} className="bg-indigo-600 text-white px-4 py-2 rounded">{showForm && formType === 'room' ? 'Cancel' : '+ Add Room'}</button>
-                    </div>
-                    {showForm && formType === 'room' && renderForm()}
-                    <div className="table-container">
-                      <table className="data-table">
-                        <thead><tr><th>Room</th><th>Building</th><th>Floor</th><th>Capacity</th><th>Equipment</th><th>Type</th></tr></thead>
-                        <tbody>
-                          {rooms.map((room) => (
-                            <tr key={room._id}>
-                              <td><strong>{room.nom}</strong></td>
-                              <td>{room.batiment}</td><td>{room.etage}</td><td>{room.capacite}</td>
-                              <td>{room.equipment?.join(', ') || '-'}</td>
-                              <td>{room.nom.includes('Amphi') ? 'Amphitheater' : 'Classroom'}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                )}
-
-                {activeTab === 'modules' && (
-                  <div>
-                    <div className="flex justify-between items-center mb-4">
-                      <h3 className="text-lg font-semibold">All Modules</h3>
-                      <button onClick={() => { setFormType('module'); setShowForm(!showForm); setFormData({}); }} className="bg-indigo-600 text-white px-4 py-2 rounded">{showForm && formType === 'module' ? 'Cancel' : '+ Add Module'}</button>
-                    </div>
-                    {showForm && formType === 'module' && renderForm()}
-                    <div className="table-container">
-                      <table className="data-table">
-                        <thead><tr><th>Code</th><th>Name</th><th>Dept</th><th>Sem</th><th>Professor</th><th>Cr</th><th>Hrs</th></tr></thead>
-                        <tbody>
-                          {modules.map((module) => (
-                            <tr key={module._id}>
-                              <td><strong>{module.code}</strong></td><td>{module.name}</td>
-                              <td><span className={getDepartmentColor(module.department)}>{module.department}</span></td>
-                              <td>{module.semester}</td>
-                              <td>{module.professor?.name} {module.professor?.prenom}</td>
-                              <td>{module.credits}</td><td>{module.hours}h</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                )}
-
-                {activeTab === 'exams' && (
-                  <div>
-                    <div className="table-container">
-                      <table className="data-table">
-                        <thead><tr><th>Module</th><th>Code</th><th>Date</th><th>Time</th><th>Room</th><th>Supervisor</th></tr></thead>
-                        <tbody>
-                          {exams.map((exam) => (
-                            <tr key={exam._id}>
-                              <td>{exam.module}</td><td>{exam.code_module}</td>
-                              <td>{new Date(exam.date).toLocaleDateString()}</td>
-                              <td>{exam.heure_debut} - {exam.heure_fin}</td>
-                              <td>{exam.salle?.nom || '-'}</td>
-                              <td>{exam.surveillant?.name} {exam.surveillant?.prenom}</td>
-                            </tr>
-                          ))}
-                          {exams.length === 0 && <tr><td colSpan="6" style={{ textAlign: 'center', padding: '40px' }}>No exams scheduled yet.</td></tr>}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                )}
-
-                {activeTab === 'studentsBySemester' && isAdmin && (
-                  <div>
-                    <h3 className="font-bold text-xl mb-4">🎓 Students by Promotion and Semester</h3>
-                    <div className="bg-green-50 p-4 rounded-lg mb-6 border-l-4 border-green-500">
-                      <h4 className="font-bold text-green-800">📅 Current Academic Period</h4>
-                      <p className="text-green-700">Current: <strong>Semester 2 (S2)</strong>, <strong>Semester 4 (S4)</strong>, <strong>Semester 6 (S6)</strong></p>
-                    </div>
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
-                      {['S1', 'S2', 'S3', 'S4', 'S5', 'S6'].map(sem => {
-                        const giCount = users.filter(u => u.role === 'etudiant' && u.departement === 'GI' && u.niveau === sem).length;
-                        const idsCount = users.filter(u => u.role === 'etudiant' && u.departement === 'IDS' && u.niveau === sem).length;
-                        const names = { S1: 'Licence 1 - S1', S2: 'Licence 1 - S2', S3: 'Licence 2 - S3', S4: 'Licence 2 - S4', S5: 'Licence 3 - S5', S6: 'Licence Pro - S6' };
-                        const isCurrent = sem === 'S2' || sem === 'S4' || sem === 'S6';
-                        return (
-                          <div key={sem} className={`bg-white rounded-lg shadow-md p-4 border-l-4 ${isCurrent ? 'border-green-500' : 'border-gray-300'}`}>
-                            <h4 className="font-bold text-lg mb-2">{names[sem]}</h4>
-                            {isCurrent && <span className="inline-block bg-green-100 text-green-800 text-xs px-2 py-1 rounded mb-2">Current</span>}
-                            <div><span className="text-blue-600">GI:</span> {giCount}</div>
-                            <div><span className="text-green-600">IDS:</span> {idsCount}</div>
-                            <div className="pt-2 border-t"><strong>Total: {giCount + idsCount}</strong></div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-              </>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
             )}
-          </div>
-        </div>
+
+            {/* ── PROFESSORS TAB (Admin) ── */}
+            {activeTab === 'professors' && isAdmin && (
+              <div style={{ background:'white', borderRadius:'12px', overflow:'auto', padding:'16px' }}>
+                <h3 style={{ margin:'0 0 12px', color:'#0f3b5f' }}>👨‍🏫 Professeurs & Surveillants ({users.length})</h3>
+                <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                  <thead>
+                    <tr style={{ background:'#f8fafc' }}>
+                      <th style={{ padding:'10px', textAlign:'left' }}>Nom</th>
+                      <th style={{ padding:'10px', textAlign:'left' }}>Email</th>
+                      <th style={{ padding:'10px', textAlign:'left' }}>Spécialisation</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {users.map(u => (
+                      <tr key={u._id || u.id} style={{ borderTop:'1px solid #e2e8f0' }}>
+                        <td style={{ padding:'10px', fontWeight:'600' }}>{u.name} {u.prenom}</td>
+                        <td style={{ padding:'10px', fontSize:'13px', color:'#64748b' }}>{u.email}</td>
+                        <td style={{ padding:'10px', fontSize:'13px', color:'#475569' }}>{u.specialization || '-'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+          </>
+        )}
       </div>
     </div>
   );

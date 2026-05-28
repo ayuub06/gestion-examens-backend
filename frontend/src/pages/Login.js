@@ -58,9 +58,9 @@ const Login = () => {
         
         <div className="demo-accounts">
           <p><strong>Demo Accounts:</strong></p>
-          <p>📚 Admin: admin@university.com / admin123</p>
-          <p>👨‍🏫 Professor: ahmed.benali@university.com / prof123</p>
-          <p>👨‍🎓 Student: ayoub.imourigue@university.com / student123</p>
+          <p>📚 Admin: ayoub.imourigue@admin.uca.ma / admin123</p>
+          <p>👨‍🏫 Professor: hassan.fauzi@uca.ma / prof123</p>
+          <p>👨‍🎓 Student: student.gi24001@edu.uca.ma / student123</p>
           <hr style={{ margin: '10px 0' }} />
           <p style={{ fontSize: '12px', color: '#666' }}>
             ⚠️ Registration is disabled. Accounts are created by administrators only.
