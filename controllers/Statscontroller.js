@@ -1,61 +1,54 @@
-const Exam = require('../models/Exam');
-const User = require('../models/User');
-const Room = require('../models/Room');
+const Exam   = require('../models/Exam');
+const User   = require('../models/User');
+const Room   = require('../models/Room');
 const Module = require('../models/Module');
 
-exports.getStats = async (req, res) => {
+exports.getDashboardStats = async (req, res) => {
   try {
-    const [totalStudents, totalProfessors, totalAdmins, totalRooms, totalModules, totalExams] = await Promise.all([
+    const [
+      totalStudents, totalProfessors, totalRooms, totalModules, totalExams,
+      examsBySession, examsByDept, examsByProf, roomUsage,
+    ] = await Promise.all([
       User.countDocuments({ role: 'etudiant' }),
       User.countDocuments({ role: 'professeur' }),
-      User.countDocuments({ role: 'admin' }),
-      Room.countDocuments({}),
-      Module.countDocuments({}),
-      Exam.countDocuments({}),
+      Room.countDocuments({ isActive: true }),
+      Module.countDocuments(),
+      Exam.countDocuments(),
+      Exam.aggregate([{ $group: { _id: '$session', count: { $sum: 1 } } }]),
+      Exam.aggregate([{ $group: { _id: '$department', count: { $sum: 1 } } }]),
+      Exam.aggregate([
+        { $group: { _id: '$surveillant', count: { $sum: 1 } } },
+        { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'prof' } },
+        { $unwind: { path: '$prof', preserveNullAndEmptyArrays: true } },
+        { $project: { name: { $concat: ['$prof.name', ' ', '$prof.prenom'] }, count: 1 } },
+        { $sort: { count: -1 } },
+      ]),
+      Room.aggregate([
+        { $lookup: { from: 'exams', localField: '_id', foreignField: 'salle', as: 'exams' } },
+        { $project: { nom: 1, type: 1, capacite: 1, examCount: { $size: '$exams' } } },
+        { $sort: { examCount: -1 } },
+      ]),
     ]);
 
-    // Exams today
     const today = new Date();
-    const todayStart = new Date(today.setHours(0, 0, 0, 0));
-    const todayEnd = new Date(today.setHours(23, 59, 59, 999));
-    const examsToday = await Exam.countDocuments({ date: { $gte: todayStart, $lte: todayEnd } });
-
-    // Exams by department
-    const byDept = await Exam.aggregate([{ $group: { _id: '$department', count: { $sum: 1 } } }]);
-
-    // Exams by session
-    const bySession = await Exam.aggregate([{ $group: { _id: '$session', count: { $sum: 1 } } }]);
-
-    // Professor workload
-    const profWorkload = await Exam.aggregate([
-      { $group: { _id: '$surveillant', count: { $sum: 1 } } },
-      { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'prof' } },
-      { $unwind: '$prof' },
-      { $project: { name: { $concat: ['$prof.name', ' ', '$prof.prenom'] }, count: 1 } },
-      { $sort: { count: -1 } },
-    ]);
-
-    // Room occupation rate
-    const roomOccupation = await Exam.aggregate([
-      { $group: { _id: '$salle', count: { $sum: 1 } } },
-      { $lookup: { from: 'rooms', localField: '_id', foreignField: '_id', as: 'room' } },
-      { $unwind: '$room' },
-      { $project: { name: '$room.nom', capacity: '$room.capacite', examCount: '$count' } },
-      { $sort: { examCount: -1 } },
-    ]);
+    today.setHours(0, 0, 0, 0);
+    const todayExams = await Exam.find({
+      date: { $gte: today, $lt: new Date(today.getTime() + 86400000) },
+    }).populate('salle', 'nom').populate('surveillant', 'name prenom').sort({ heure_debut: 1 });
 
     res.json({
       success: true,
       stats: {
-        users: { total: totalStudents + totalProfessors + totalAdmins, students: totalStudents, professors: totalProfessors, admins: totalAdmins },
+        users: { total: totalStudents + totalProfessors, students: totalStudents, professors: totalProfessors },
         rooms: totalRooms,
         modules: totalModules,
-        exams: { total: totalExams, today: examsToday, byDepartment: byDept, bySession },
-        professorWorkload: profWorkload,
-        roomOccupation,
+        exams: { total: totalExams, bySession: examsBySession, byDepartment: examsByDept },
+        professors: examsByProf,
+        roomUsage,
+        todayExams,
       },
     });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 };

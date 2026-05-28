@@ -1,5 +1,6 @@
-import axios from "axios";
+﻿import axios from "axios";
 
+// Utiliser l'URL complète du backend
 const API_URL = "http://localhost:5000/api";
 
 const api = axios.create({
@@ -7,6 +8,7 @@ const api = axios.create({
   headers: {
     "Content-Type": "application/json",
   },
+  timeout: 30000,
 });
 
 api.interceptors.request.use((config) => {
@@ -16,5 +18,13 @@ api.interceptors.request.use((config) => {
   }
   return config;
 });
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    console.error("API Error:", error.response?.status, error.response?.data);
+    return Promise.reject(error);
+  }
+);
 
 export default api;

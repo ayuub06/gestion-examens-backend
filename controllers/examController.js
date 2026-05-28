@@ -1,190 +1,165 @@
-﻿const Exam = require('../models/Exam');
-const User = require('../models/User');
+﻿const mongoose = require('mongoose');
+const Exam = require('../models/Exam');
 
-const POPULATE = [
-  { path: 'salle', select: 'nom capacite batiment etage type' },
-  { path: 'surveillant', select: 'name prenom email specialization' },
-  { path: 'surveillants_supplementaires', select: 'name prenom email' },
-];
+// Map student niveau → which semesters their exams belong to
+const NIVEAU_TO_SEMS = {
+  DUT1:    ['S1','S2'],
+  DUT2:    ['S3','S4'],
+  Bachelor:['S5','S6'],
+  // legacy fallbacks
+  S1:['S1'], S2:['S2'], S3:['S3'], S4:['S4'], S5:['S5'], S6:['S6'],
+};
 
-// ─── GET ALL (admin) ─────────────────────────────────────────────────────────
+const populate = q =>
+  q.populate('salle',       'nom capacite batiment type')
+   .populate('surveillant', 'name prenom email specialization')
+   .populate('surveillants','name prenom email')
+   .populate('etudiants',   'name prenom email numero_etudiant departement niveau');
+
+// ── GET /api/exams  (admin) ───────────────────────────────────────────────────
 exports.getAllExams = async (req, res) => {
   try {
-    const { department, semester, session, date, status } = req.query;
     const filter = {};
-    if (department) filter.department = department;
-    if (semester) filter.semester = semester;
-    if (session) filter.session = session;
-    if (status) filter.status = status;
-    if (date) {
-      const d = new Date(date);
-      filter.date = {
-        $gte: new Date(d.setHours(0, 0, 0, 0)),
-        $lte: new Date(d.setHours(23, 59, 59, 999)),
-      };
-    }
+    if (req.query.session)    filter.session    = req.query.session;
+    if (req.query.department) filter.department = req.query.department;
+    if (req.query.semester)   filter.semester   = req.query.semester;
 
-    const exams = await Exam.find(filter).populate(POPULATE).sort({ date: 1, heure_debut: 1 });
-    res.json({ success: true, count: exams.length, exams });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+    const exams = await populate(Exam.find(filter).sort({ date:1, heure_debut:1 }));
+    res.json({ success:true, total:exams.length, exams });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 };
 
-// ─── GET MY EXAMS (student: by dept+niveau) ──────────────────────────────────
+// ── GET /api/exams/my-exams  (étudiant) ───────────────────────────────────────
 exports.getMyExams = async (req, res) => {
   try {
-    const user = req.user;
-    if (user.role !== 'etudiant') {
-      return res.status(403).json({ success: false, message: 'Réservé aux étudiants.' });
-    }
-    const exams = await Exam.find({ department: user.departement, semester: user.niveau })
-      .populate(POPULATE)
-      .sort({ date: 1, heure_debut: 1 });
-    res.json({ success: true, count: exams.length, exams });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+    const u = req.user;
+
+    // Map this student's niveau to the semesters whose exams they attend
+    const semesters = NIVEAU_TO_SEMS[u.niveau] || [];
+
+    const query = {
+      $or: [
+        // Primary: student is explicitly listed
+        { etudiants: u._id },
+        // Fallback: exam is for their dept + matching semesters
+        ...(u.departement && semesters.length ? [{
+          department: u.departement,
+          semester:   { $in: semesters },
+        }] : []),
+        // Also match COMMON modules at their niveau
+        ...(semesters.length ? [{
+          department: 'COMMON',
+          semester:   { $in: semesters },
+        }] : []),
+      ],
+    };
+
+    const exams = await populate(Exam.find(query).sort({ date:1, heure_debut:1 }));
+    res.json({ success:true, exams });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 };
 
-// ─── GET MY SUPERVISIONS (professor) ─────────────────────────────────────────
+// ── GET /api/exams/my-supervisions  (professeur) ──────────────────────────────
 exports.getMySupervisions = async (req, res) => {
   try {
-    const user = req.user;
-    if (user.role !== 'professeur') {
-      return res.status(403).json({ success: false, message: 'Réservé aux professeurs.' });
-    }
-    const exams = await Exam.find({
-      $or: [{ surveillant: user._id }, { surveillants_supplementaires: user._id }],
-    })
-      .populate(POPULATE)
-      .sort({ date: 1, heure_debut: 1 });
-    res.json({ success: true, count: exams.length, exams });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+    const id = req.user._id;
+    const exams = await populate(
+      Exam.find({
+        $or: [
+          { surveillant:  id },
+          { surveillants: id },
+        ],
+      }).sort({ date:1, heure_debut:1 })
+    );
+    res.json({ success:true, exams });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 };
 
-// ─── GET ONE ─────────────────────────────────────────────────────────────────
+// ── GET /api/exams/:id ─────────────────────────────────────────────────────────
 exports.getExamById = async (req, res) => {
   try {
-    const exam = await Exam.findById(req.params.id)
-      .populate(POPULATE)
-      .populate({ path: 'etudiants', select: 'name prenom email numero_etudiant departement niveau' });
-    if (!exam) return res.status(404).json({ success: false, message: 'Examen introuvable.' });
-    res.json({ success: true, exam });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+    const exam = await populate(Exam.findById(req.params.id));
+    if (!exam) return res.status(404).json({ success:false, message:'Examen introuvable.' });
+    res.json({ success:true, exam });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 };
 
-// ─── CREATE ──────────────────────────────────────────────────────────────────
+// ── POST /api/exams  (admin) ───────────────────────────────────────────────────
 exports.createExam = async (req, res) => {
   try {
-    const { module, code_module, date, heure_debut, heure_fin, salle, surveillant, department, semester, session } = req.body;
-
-    // Conflict checks
-    const [roomConflict, profConflict] = await Promise.all([
-      Exam.findOne({ salle, date: new Date(date) }).then((e) =>
-        e && hasOverlap(heure_debut, heure_fin, e.heure_debut, e.heure_fin) ? e : null
-      ),
-      Exam.findOne({ surveillant, date: new Date(date) }).then((e) =>
-        e && hasOverlap(heure_debut, heure_fin, e.heure_debut, e.heure_fin) ? e : null
-      ),
-    ]);
-
-    if (roomConflict) return res.status(409).json({ success: false, message: 'Conflit de salle sur ce créneau.' });
-    if (profConflict) return res.status(409).json({ success: false, message: 'Conflit de surveillant sur ce créneau.' });
-
-    // Auto-assign students
-    const students = await User.find({ role: 'etudiant', departement: department, niveau: semester }).select('_id');
-
-    const exam = new Exam({
-      module, code_module, date, heure_debut, heure_fin, salle, surveillant,
-      department, semester, session: session || 'normale',
-      etudiants: students.map((s) => s._id),
-      nombre_etudiants: students.length,
-    });
+    const exam = new Exam(req.body);
     await exam.save();
-    await exam.populate(POPULATE);
-    res.status(201).json({ success: true, exam });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    const populated = await populate(Exam.findById(exam._id));
+    res.status(201).json({ success:true, exam:populated });
+  } catch(e) {
+    if(e.code===11000) return res.status(409).json({ success:false, message:'Créneau/salle déjà pris.' });
+    res.status(500).json({ success:false, message:e.message });
   }
 };
 
-// ─── UPDATE ──────────────────────────────────────────────────────────────────
+// ── PUT /api/exams/:id ─────────────────────────────────────────────────────────
 exports.updateExam = async (req, res) => {
   try {
-    const exam = await Exam.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true }).populate(POPULATE);
-    if (!exam) return res.status(404).json({ success: false, message: 'Examen introuvable.' });
-    res.json({ success: true, exam });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+    const exam = await Exam.findByIdAndUpdate(req.params.id, req.body, { new:true });
+    if (!exam) return res.status(404).json({ success:false, message:'Examen introuvable.' });
+    res.json({ success:true, exam });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 };
 
-// ─── DELETE ──────────────────────────────────────────────────────────────────
+// ── DELETE /api/exams/:id ──────────────────────────────────────────────────────
 exports.deleteExam = async (req, res) => {
   try {
     const exam = await Exam.findByIdAndDelete(req.params.id);
-    if (!exam) return res.status(404).json({ success: false, message: 'Examen introuvable.' });
-    res.json({ success: true, message: 'Examen supprimé.' });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+    if (!exam) return res.status(404).json({ success:false, message:'Examen introuvable.' });
+    res.json({ success:true, message:'Examen supprimé.' });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 };
 
-// ─── ASSIGN / REMOVE STUDENT ─────────────────────────────────────────────────
+// ── POST /api/exams/:id/assign-student ────────────────────────────────────────
 exports.assignStudent = async (req, res) => {
   try {
-    const { examId, studentId } = req.body;
     const exam = await Exam.findByIdAndUpdate(
-      examId,
-      { $addToSet: { etudiants: studentId } },
-      { new: true }
+      req.params.id,
+      { $addToSet: { etudiants: req.body.studentId } },
+      { new:true }
     );
-    if (!exam) return res.status(404).json({ success: false, message: 'Examen introuvable.' });
-    res.json({ success: true, message: 'Étudiant ajouté.', exam });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+    res.json({ success:true, exam });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 };
 
+// ── DELETE /api/exams/:id/remove-student ──────────────────────────────────────
 exports.removeStudent = async (req, res) => {
   try {
-    const { examId, studentId } = req.body;
-    const exam = await Exam.findByIdAndUpdate(examId, { $pull: { etudiants: studentId } }, { new: true });
-    if (!exam) return res.status(404).json({ success: false, message: 'Examen introuvable.' });
-    res.json({ success: true, message: 'Étudiant retiré.', exam });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+    const exam = await Exam.findByIdAndUpdate(
+      req.params.id,
+      { $pull: { etudiants: req.body.studentId } },
+      { new:true }
+    );
+    res.json({ success:true, exam });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 };
 
-// ─── BY STUDENT / PROFESSOR ──────────────────────────────────────────────────
+// ── GET /api/exams/student/:studentId ─────────────────────────────────────────
 exports.getStudentExams = async (req, res) => {
   try {
-    const student = await User.findById(req.params.studentId);
-    if (!student) return res.status(404).json({ success: false, message: 'Étudiant introuvable.' });
-    const exams = await Exam.find({ department: student.departement, semester: student.niveau }).populate(POPULATE).sort({ date: 1 });
-    res.json({ success: true, exams });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+    const student = await require('../models/User').findById(req.params.studentId);
+    const semesters = NIVEAU_TO_SEMS[student?.niveau] || [];
+    const exams = await populate(Exam.find({
+      $or:[
+        { etudiants: req.params.studentId },
+        ...(student?.departement && semesters.length ? [{ department:student.departement, semester:{$in:semesters} }] : []),
+      ]
+    }).sort({date:1}));
+    res.json({ success:true, exams });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 };
 
+// ── GET /api/exams/professor/:professorId ─────────────────────────────────────
 exports.getProfessorExams = async (req, res) => {
   try {
-    const exams = await Exam.find({ surveillant: req.params.professorId }).populate(POPULATE).sort({ date: 1 });
-    res.json({ success: true, exams });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
+    const exams = await populate(Exam.find({
+      $or:[{surveillant:req.params.professorId},{surveillants:req.params.professorId}]
+    }).sort({date:1}));
+    res.json({ success:true, exams });
+  } catch(e) { res.status(500).json({ success:false, message:e.message }); }
 };
-
-// ─── HELPER ──────────────────────────────────────────────────────────────────
-function hasOverlap(s1, e1, s2, e2) {
-  const toMin = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
-  return toMin(s1) < toMin(e2) && toMin(e1) > toMin(s2);
-}

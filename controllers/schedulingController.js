@@ -178,7 +178,47 @@ exports.autoGenerateSchedule = async (req, res) => {
     if (!rooms.length)       return res.status(400).json({ success:false, message:'Aucune salle. Lancez: npm run seed' });
     if (!professors.length)  return res.status(400).json({ success:false, message:'Aucun professeur. Lancez: npm run seed' });
 
-    console.log(`\n📚 ${allModules.length} modules | 🏫 ${rooms.length} salles | 👨‍🏫 ${professors.length} profs`);
+    console.log(`\n📚 ${allModules.length} modules bruts | 🏫 ${rooms.length} salles | 👨‍🏫 ${professors.length} profs`);
+
+    // ── Step 3b: cap to MAX_EXAMS per student group (dept+sem) ────────────
+    const MAX_EXAMS_PER_GROUP = 7;
+
+    // Group by semester: separate COMMON from per-dept
+    const bySem = {};
+    allModules.forEach(m => {
+      if (!bySem[m.semester]) bySem[m.semester] = { common: [], byDept: {} };
+      if (m.department === 'COMMON') {
+        bySem[m.semester].common.push(m);
+      } else {
+        if (!bySem[m.semester].byDept[m.department]) bySem[m.semester].byDept[m.department] = [];
+        bySem[m.semester].byDept[m.department].push(m);
+      }
+    });
+
+    const schedulableMods = [];
+    const _addedIds = new Set();
+    const _add = m => { const id = m._id.toString(); if (!_addedIds.has(id)) { _addedIds.add(id); schedulableMods.push(m); } };
+
+    for (const [sem, { common, byDept }] of Object.entries(bySem)) {
+      const sortedCommon = [...common].sort((a,b) => (b.credits||0)-(a.credits||0));
+      const commonCount  = Math.min(sortedCommon.length, MAX_EXAMS_PER_GROUP);
+      const maxDeptMods  = Math.max(0, MAX_EXAMS_PER_GROUP - commonCount);
+
+      // COMMON modules (capped)
+      if (sortedCommon.length > MAX_EXAMS_PER_GROUP)
+        console.log(`⚠️  Cap COMMON_${sem}: ${sortedCommon.length} → ${MAX_EXAMS_PER_GROUP}`);
+      sortedCommon.slice(0, MAX_EXAMS_PER_GROUP).forEach(_add);
+
+      // Dept-specific modules (capped per dept so total ≤ MAX_EXAMS_PER_GROUP)
+      for (const [dept, mods] of Object.entries(byDept)) {
+        const sorted = [...mods].sort((a,b) => (b.credits||0)-(a.credits||0));
+        if (mods.length > maxDeptMods)
+          console.log(`⚠️  Cap ${dept}_${sem}: ${mods.length} → ${maxDeptMods} (COMMON=${commonCount})`);
+        sorted.slice(0, maxDeptMods).forEach(_add);
+      }
+    }
+
+    console.log(`📚 ${allModules.length} → ${schedulableMods.length} modules après cap ${MAX_EXAMS_PER_GROUP}/groupe`);
 
     // ── Step 4: student map ────────────────────────────────────────────────
     const allStudents = await User.find({ role:'etudiant' }).select('_id departement niveau');
@@ -410,8 +450,8 @@ exports.autoGenerateSchedule = async (req, res) => {
     };
 
     // ── Step 7: split modules by semester and schedule ─────────────────────
-    const normaleMods    = allModules.filter(m => SESSION_CONFIG.normale.semesters.includes(m.semester));
-    const rattrapageMods = allModules.filter(m => SESSION_CONFIG.rattrapage.semesters.includes(m.semester));
+    const normaleMods    = schedulableMods.filter(m => SESSION_CONFIG.normale.semesters.includes(m.semester));
+    const rattrapageMods = schedulableMods.filter(m => SESSION_CONFIG.rattrapage.semesters.includes(m.semester));
 
     const normaleDates    = buildWorkingDaysInRange(SESSION_CONFIG.normale.start,    SESSION_CONFIG.normale.end);
     const rattrapageDates = buildWorkingDaysInRange(SESSION_CONFIG.rattrapage.start, SESSION_CONFIG.rattrapage.end);
@@ -431,7 +471,7 @@ exports.autoGenerateSchedule = async (req, res) => {
       if (slots > 0) console.log(`   ${`${p.name} ${p.prenom}`.padEnd(30)}: ${slots} surveillance(s)`);
     }
 
-    console.log(`\n✅ Planifiés : ${scheduledExams.length} / ${allModules.length}`);
+    console.log(`\n✅ Planifiés : ${scheduledExams.length} / ${schedulableMods.length} (${allModules.length} total avant cap)`);
     console.log(`⚠️  Conflits  : ${conflicts.length}`);
 
     res.json({

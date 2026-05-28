@@ -2,6 +2,7 @@
 import api from "../services/api";
 
 const AuthContext = createContext();
+
 export const useAuth = () => useContext(AuthContext);
 
 export const AuthProvider = ({ children }) => {
@@ -22,9 +23,8 @@ export const AuthProvider = ({ children }) => {
     try {
       const res = await api.get("/auth/me");
       setUser(res.data.user);
-      console.log("Utilisateur chargé:", res.data.user);
     } catch (err) {
-      console.error("Erreur chargement utilisateur:", err);
+      console.error("Load user error:", err);
       localStorage.removeItem("token");
       delete api.defaults.headers.common["Authorization"];
     }
