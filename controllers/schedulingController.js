@@ -35,14 +35,11 @@ const TIME_SLOTS = [
   { start:'16:30', end:'18:30' },
 ];
 
-// Semester → student niveau values in DB (covers both DUT/Bachelor and legacy S1-S6 stored directly)
+// Semester → student niveau values in DB (normale session only: S1/S3/S5)
 const SEM_TO_NIVEAU = {
   S1: ['DUT1','S1'],
-  S2: ['DUT1','S2'],
   S3: ['DUT2','S3'],
-  S4: ['DUT2','S4'],
   S5: ['Bachelor','S5'],
-  S6: ['Bachelor','S6'],
 };
 
 const ROOM_SURVEILLANTS = { amphi:3, grande_salle:2, petite_salle:1, labo:1 };
@@ -61,10 +58,9 @@ const ROOM_FALLBACK = {
   labo:         ['labo','petite_salle','grande_salle','amphi'],
 };
 
-// Fixed session config: normale = S1/S3/S5 (01-07 Jun), rattrapage = S2/S4/S6 (08-15 Jun)
+// Session normale only: S1/S3/S5 (01-07 Jun)
 const SESSION_CONFIG = {
-  normale:    { start:'2026-06-01', end:'2026-06-07', semesters:['S1','S3','S5'], label:'Normale (01–07 Juin 2026)' },
-  rattrapage: { start:'2026-06-08', end:'2026-06-15', semesters:['S2','S4','S6'], label:'Rattrapage (08–15 Juin 2026)' },
+  normale: { start:'2026-06-01', end:'2026-06-07', semesters:['S1','S3','S5'], label:'Normale (01–07 Juin 2026)' },
 };
 
 // ── GET /api/scheduling/current-session ───────────────────────────────────────
@@ -145,8 +141,7 @@ exports.scheduleExam = async (req, res) => {
 exports.autoGenerateSchedule = async (req, res) => {
   try {
     console.log('\n🎯 ═══ GÉNÉRATION AUTOMATIQUE 2026 ═══');
-    console.log(`   Normale    : ${SESSION_CONFIG.normale.label}  → ${SESSION_CONFIG.normale.semesters.join(',')}`);
-    console.log(`   Rattrapage : ${SESSION_CONFIG.rattrapage.label} → ${SESSION_CONFIG.rattrapage.semesters.join(',')}`);
+    console.log(`   Session : ${SESSION_CONFIG.normale.label} → ${SESSION_CONFIG.normale.semesters.join(',')}`);
 
     // ── Step 1: fix rooms missing a type field ──────────────────────────────
     const noTypeRooms = await Room.find({ type:{ $exists:false }, isActive:{ $ne:false } });
@@ -162,14 +157,14 @@ exports.autoGenerateSchedule = async (req, res) => {
       }
     }
 
-    // ── Step 2: delete ALL existing exams ─────────────────────────────────
+    // ── Step 2: delete ALL existing exams and ensure unique room index ────
     const del = await Exam.deleteMany({});
+    await Exam.syncIndexes(); // ensures unique(salle+date+heure_debut) is active
     console.log(`🗑️  ${del.deletedCount} examens supprimés`);
 
     // ── Step 3: load data ──────────────────────────────────────────────────
-    const allSemesters = [...SESSION_CONFIG.normale.semesters, ...SESSION_CONFIG.rattrapage.semesters];
     const [allModules, rooms, professors] = await Promise.all([
-      Module.find({ semester:{ $in:allSemesters } }),
+      Module.find({ semester:{ $in:SESSION_CONFIG.normale.semesters } }),
       Room.find({ isActive:{ $ne:false } }),
       User.find({ role:'professeur' }),
     ]);
@@ -273,7 +268,7 @@ exports.autoGenerateSchedule = async (req, res) => {
 
     const isProfFree = (id, ds, s, e) => {
       const sl = profBusy[id]?.[ds] || [];
-      if (sl.length >= 2) return false;
+      if (sl.length >= 2) return false; // max 2 surveillances per day per professor
       return !sl.some(x => overlaps(s, e, x.start, x.end));
     };
 
@@ -294,6 +289,7 @@ exports.autoGenerateSchedule = async (req, res) => {
       if (!profBusy[id])     profBusy[id]     = {};
       if (!profBusy[id][ds]) profBusy[id][ds] = [];
       profBusy[id][ds].push({ start:s, end:e });
+      profTotal[id] = (profTotal[id] || 0) + 1;
     };
     const markRoom = (id, ds, s, e) => {
       if (!roomBusy[id])     roomBusy[id]     = {};
@@ -310,29 +306,32 @@ exports.autoGenerateSchedule = async (req, res) => {
       });
     };
 
-    // Persistent round-robin professor picker
-    const profList = shuffle([...professors]);
-    let profIdx = 0;
+    // Fair professor picker: always pick least-loaded available professor
+    const profTotal = {};
+    professors.forEach(p => { profTotal[p._id.toString()] = 0; });
 
     const pickProf = (ds, s, e) => {
-      const n = profList.length;
-      for (let attempt = 0; attempt < n; attempt++) {
-        const candidate = profList[profIdx % n];
-        profIdx = (profIdx + 1) % n;
-        if (isProfFree(candidate._id.toString(), ds, s, e)) return candidate;
-      }
-      return null;
+      const sorted = [...professors].sort((a, b) =>
+        (profTotal[a._id.toString()] || 0) - (profTotal[b._id.toString()] || 0)
+      );
+      return sorted.find(p => isProfFree(p._id.toString(), ds, s, e)) || null;
     };
 
     const pickRoom = (examType, count, ds, s, e) => {
       const pref  = pickRoomType(examType, count);
       const order = ROOM_FALLBACK[pref] || [pref];
+      // Sort by total bookings ascending so least-used rooms are tried first
+      const byUsage = [...rooms].sort((a, b) => {
+        const ua = Object.values(roomBusy[a._id.toString()] || {}).reduce((n, sl) => n + sl.length, 0);
+        const ub = Object.values(roomBusy[b._id.toString()] || {}).reduce((n, sl) => n + sl.length, 0);
+        return ua - ub;
+      });
       for (const rt of order) {
-        const r = rooms.find(r => r.type === rt && r.capacite >= count && isRoomFree(r._id.toString(), ds, s, e));
+        const r = byUsage.find(r => r.type === rt && r.capacite >= count && isRoomFree(r._id.toString(), ds, s, e));
         if (r) return r;
       }
       // last resort: largest free room regardless of capacity
-      return rooms
+      return byUsage
         .filter(r => isRoomFree(r._id.toString(), ds, s, e))
         .sort((a, b) => b.capacite - a.capacite)[0] || null;
     };
@@ -376,17 +375,20 @@ exports.autoGenerateSchedule = async (req, res) => {
             const prof = pickProf(ds, slot.start, slot.end);
             if (!prof) continue;
 
-            // 4. Pick co-surveillants based on room type
+            // 4. Gather co-surveillant candidates (least-loaded first)
             const needed = ROOM_SURVEILLANTS[room.type] || 1;
-            const extras = [];
-            for (const p of profList) {
-              if (extras.length >= needed - 1) break;
+            const extraCandidates = [];
+            const sortedForExtra = [...professors].sort((a, b) =>
+              (profTotal[a._id.toString()] || 0) - (profTotal[b._id.toString()] || 0)
+            );
+            for (const p of sortedForExtra) {
+              if (extraCandidates.length >= needed - 1) break;
               if (p._id.toString() === prof._id.toString()) continue;
               if (isProfFree(p._id.toString(), ds, slot.start, slot.end)) {
-                extras.push(p._id);
-                markProf(p._id.toString(), ds, slot.start, slot.end);
+                extraCandidates.push(p);
               }
             }
+            const extras = extraCandidates.map(p => p._id);
 
             // 5. Convert IDs and save exam
             const etudiantOids = studentIds.map(id => {
@@ -412,13 +414,18 @@ exports.autoGenerateSchedule = async (req, res) => {
 
             try { await exam.save(); }
             catch (se) {
-              if (se.code === 11000) continue; // index conflict — try next slot
+              if (se.code === 11000) {
+                // Room was taken by a concurrent request — sync in-memory and try next slot
+                markRoom(room._id.toString(), ds, slot.start, slot.end);
+                continue;
+              }
               throw se;
             }
 
-            // 6. Mark all trackers AFTER successful save
+            // 6. Mark ALL trackers AFTER successful save (no risk of poisoning on failure)
             markProf(prof._id.toString(), ds, slot.start, slot.end);
             markRoom(room._id.toString(), ds, slot.start, slot.end);
+            for (const p of extraCandidates) markProf(p._id.toString(), ds, slot.start, slot.end);
             markGroup(mod, ds, slot.start);
 
             scheduledExams.push({
@@ -449,26 +456,23 @@ exports.autoGenerateSchedule = async (req, res) => {
       }
     };
 
-    // ── Step 7: split modules by semester and schedule ─────────────────────
-    const normaleMods    = schedulableMods.filter(m => SESSION_CONFIG.normale.semesters.includes(m.semester));
-    const rattrapageMods = schedulableMods.filter(m => SESSION_CONFIG.rattrapage.semesters.includes(m.semester));
+    // ── Step 7: schedule normale session only ─────────────────────────────
+    const normaleDates = buildWorkingDaysInRange(SESSION_CONFIG.normale.start, SESSION_CONFIG.normale.end);
+    console.log(`\n📅 Normale (${schedulableMods.length} modules): ${normaleDates.map(d=>d.toISOString().split('T')[0]).join(', ')}`);
 
-    const normaleDates    = buildWorkingDaysInRange(SESSION_CONFIG.normale.start,    SESSION_CONFIG.normale.end);
-    const rattrapageDates = buildWorkingDaysInRange(SESSION_CONFIG.rattrapage.start, SESSION_CONFIG.rattrapage.end);
-
-    console.log(`\n📅 Normale    (${normaleMods.length} modules): ${normaleDates.map(d=>d.toISOString().split('T')[0]).join(', ')}`);
-    console.log(`📅 Rattrapage (${rattrapageMods.length} modules): ${rattrapageDates.map(d=>d.toISOString().split('T')[0]).join(', ')}`);
-
-    await scheduleSession(normaleMods,    normaleDates,    'normale');
-    await scheduleSession(rattrapageMods, rattrapageDates, 'rattrapage');
+    await scheduleSession(schedulableMods, normaleDates, 'normale');
 
     // ── Professor distribution report ──────────────────────────────────────
     console.log('\n📊 DISTRIBUTION PROFESSEURS:');
     const profDist = {};
     for (const p of professors) {
-      const slots = Object.values(profBusy[p._id.toString()] || {}).reduce((s,sl) => s+sl.length, 0);
-      profDist[`${p.name} ${p.prenom}`] = slots;
-      if (slots > 0) console.log(`   ${`${p.name} ${p.prenom}`.padEnd(30)}: ${slots} surveillance(s)`);
+      const total = profTotal[p._id.toString()] || 0;
+      profDist[`${p.name} ${p.prenom}`] = total;
+      if (total > 0) console.log(`   ${`${p.name} ${p.prenom}`.padEnd(30)}: ${total} surveillance(s)`);
+    }
+    const distVals = Object.values(profDist).filter(v => v > 0);
+    if (distVals.length) {
+      console.log(`   → Min: ${Math.min(...distVals)} | Max: ${Math.max(...distVals)} | Écart: ${Math.max(...distVals)-Math.min(...distVals)}`);
     }
 
     console.log(`\n✅ Planifiés : ${scheduledExams.length} / ${schedulableMods.length} (${allModules.length} total avant cap)`);
@@ -482,10 +486,7 @@ exports.autoGenerateSchedule = async (req, res) => {
         conflicts,
         totalConflicts: conflicts.length,
         professorDistribution: profDist,
-        period: {
-          normale:    SESSION_CONFIG.normale,
-          rattrapage: SESSION_CONFIG.rattrapage,
-        },
+        period:         SESSION_CONFIG.normale,
       },
     });
 

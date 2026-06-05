@@ -12,8 +12,7 @@ const fmtDateShort = d =>
 const fmtTime = t => (t ? t.substring(0, 5) : '–');
 
 const SB = {
-  normale:    { bg:'#dbeafe', color:'#1e40af', label:'Normale'    },
-  rattrapage: { bg:'#fef3c7', color:'#92400e', label:'Rattrapage' },
+  normale: { bg:'#dbeafe', color:'#1e40af', label:'Normale' },
 };
 const RTL = { amphi:'Amphi', grande_salle:'Grande Salle', petite_salle:'Petite Salle', labo:'Labo' };
 const RC = {
@@ -34,7 +33,7 @@ const TIME_SLOTS = [
 const buildExamDays = () => {
   const days = [];
   let d = new Date('2026-06-01T12:00:00Z');
-  const end = new Date('2026-06-15T12:00:00Z');
+  const end = new Date('2026-06-07T12:00:00Z');
   while (d <= end) {
     if (d.getUTCDay() !== 0) days.push(d.toISOString().split('T')[0]);
     const n = new Date(d); n.setUTCDate(n.getUTCDate() + 1); d = n;
@@ -101,6 +100,9 @@ export default function Dashboard() {
   const [selectedExam, setSelectedExam] = useState(null);
   const [expandedRoom, setExpandedRoom] = useState(null);
   const [examFilters,  setExamFilters] = useState({ dept:'', date:'', room:'', session:'' });
+  const [allUsers,     setAllUsers]    = useState([]);
+  const [usersSearch,  setUsersSearch] = useState('');
+  const [usersFilter,  setUsersFilter] = useState('all'); // 'all' | 'filiere' | 'role'
   // capacity bar animation
   const [capBars, setCapBars] = useState({});
 
@@ -125,8 +127,12 @@ export default function Dashboard() {
       }
       if (isAdmin) {
         if (activeTab === 'professors') {
+          const res = await API.get('/auth/users?role=professeur');
+          setUsers(res.data || []);
+        }
+        if (activeTab === 'utilisateurs') {
           const res = await API.get('/auth/users');
-          setUsers((res.data || []).filter(u => u.role === 'professeur'));
+          setAllUsers(res.data || []);
         }
         if (activeTab === 'rooms') {
           const [rR, eR] = await Promise.all([API.get('/rooms'), API.get('/exams')]);
@@ -385,8 +391,7 @@ export default function Dashboard() {
       <div>
         {days.map((ds, di) => {
           const dayExams = profByDate[ds];
-          const isNormale = ds <= '2026-06-07';
-          const sb = isNormale ? SB.normale : SB.rattrapage;
+          const sb = SB.normale;
           const dayLabel = new Date(ds + 'T12:00:00Z').toLocaleDateString('fr-FR', {
             weekday:'long', day:'2-digit', month:'long', year:'numeric',
           });
@@ -453,9 +458,8 @@ export default function Dashboard() {
         {depts.map(d => <option key={d}>{d}</option>)}
       </select>
       <select value={examFilters.session} onChange={e => setExamFilters(f => ({...f, session:e.target.value}))}>
-        <option value="">Les 2 sessions</option>
+        <option value="">Toutes sessions</option>
         <option value="normale">Normale</option>
-        <option value="rattrapage">Rattrapage</option>
       </select>
       <select value={examFilters.room}    onChange={e => setExamFilters(f => ({...f, room:e.target.value}))}>
         <option value="">Toutes salles</option>
@@ -464,7 +468,7 @@ export default function Dashboard() {
       <input
         type="date" value={examFilters.date}
         onChange={e => setExamFilters(f => ({...f, date:e.target.value}))}
-        min="2026-06-01" max="2026-06-15"
+        min="2026-06-01" max="2026-06-07"
         style={{ fontFamily:'inherit' }}
       />
       {hasFilter && (
@@ -724,6 +728,215 @@ export default function Dashboard() {
     );
   };
 
+  // ── Utilisateurs tab ────────────────────────────────────────────────────
+  const DEPT_COLORS = {
+    GI:      { bg:'#dbeafe', color:'#1e40af', border:'#93c5fd' },
+    IDS:     { bg:'#d1fae5', color:'#065f46', border:'#6ee7b7' },
+    BigData: { bg:'#ede9fe', color:'#5b21b6', border:'#c4b5fd' },
+    GC:      { bg:'#fef3c7', color:'#92400e', border:'#fcd34d' },
+    GE:      { bg:'#ffedd5', color:'#9a3412', border:'#fdba74' },
+    GM:      { bg:'#fee2e2', color:'#991b1b', border:'#fca5a5' },
+    TM:      { bg:'#f0fdf4', color:'#166534', border:'#86efac' },
+    IG:      { bg:'#f0f9ff', color:'#0c4a6e', border:'#7dd3fc' },
+  };
+  const DEPT_ORDER = ['GI','IDS','BigData','GC','GE','GM','TM','IG'];
+
+  const exportCSV = (dept, rows) => {
+    const header = 'Nom,Prénom,Email,Niveau,Numéro Étudiant';
+    const lines  = rows.map(s =>
+      [s.name, s.prenom, s.email, s.niveau || '', s.numero_etudiant || '']
+        .map(v => `"${(v||'').replace(/"/g,'""')}"`)
+        .join(',')
+    );
+    const blob = new Blob([[header, ...lines].join('\n')], { type:'text/csv;charset=utf-8;' });
+    const a = Object.assign(document.createElement('a'), {
+      href: URL.createObjectURL(blob),
+      download: `etudiants_${dept}.csv`,
+    });
+    a.click(); URL.revokeObjectURL(a.href);
+  };
+
+  const UtilisateursTab = () => {
+    const q        = usersSearch.toLowerCase();
+    const matchQ   = u => !q || [u.name, u.prenom, u.email].some(f => (f||'').toLowerCase().includes(q));
+    const profs    = allUsers.filter(u => u.role === 'professeur');
+    const admins   = allUsers.filter(u => u.role === 'admin');
+    const students = allUsers.filter(u => u.role === 'etudiant');
+
+    const deptGroups = DEPT_ORDER.map(dept => {
+      const all      = students.filter(u => u.departement === dept);
+      const filtered = all.filter(matchQ);
+      return { dept, total: all.length, filtered };
+    }).filter(g => g.total > 0);
+
+    const showProfs = usersFilter !== 'filiere';
+    const showByRole = usersFilter === 'role';
+
+    return (
+      <div>
+        {/* Header + search + filter buttons */}
+        <div style={{ display:'flex', gap:10, alignItems:'center', marginBottom:18, flexWrap:'wrap' }}>
+          <h3 style={{ margin:0, color:'var(--navy)', fontWeight:800, fontSize:17, flexShrink:0 }}>
+            👥 Utilisateurs
+            <span style={{ marginLeft:8, fontSize:13, fontWeight:500, color:'var(--gray-400)' }}>
+              {allUsers.length} total
+            </span>
+          </h3>
+          <input
+            type="search" placeholder="Rechercher nom, prénom ou email…"
+            value={usersSearch}
+            onChange={e => setUsersSearch(e.target.value)}
+            style={{ flex:'1 1 200px', maxWidth:340, padding:'7px 12px', border:'1.5px solid var(--gray-200)', borderRadius:8, fontSize:13, fontFamily:'inherit', outline:'none' }}
+          />
+          <div style={{ display:'flex', gap:5, flexShrink:0 }}>
+            {[['all','Tout'],['filiere','Par Filière'],['role','Par Rôle']].map(([f,lbl]) => (
+              <button key={f} onClick={() => setUsersFilter(f)} style={{
+                padding:'5px 13px', borderRadius:99, fontSize:12, fontWeight:600, cursor:'pointer',
+                border: usersFilter === f ? '2px solid var(--navy)' : '2px solid var(--gray-200)',
+                background: usersFilter === f ? 'var(--navy)' : 'white',
+                color: usersFilter === f ? 'white' : 'var(--gray-500)',
+              }}>{lbl}</button>
+            ))}
+          </div>
+        </div>
+
+        {allUsers.length === 0 && (
+          <div className="empty-state">
+            <div className="empty-state-icon">👥</div>
+            <div className="empty-state-title">Aucun utilisateur chargé</div>
+          </div>
+        )}
+
+        {/* Admins (only in role view) */}
+        {showByRole && admins.filter(matchQ).length > 0 && (
+          <div style={{ background:'white', borderRadius:12, border:'1.5px solid #fcd34d', marginBottom:16, overflow:'hidden' }}>
+            <div style={{ padding:'10px 16px', background:'#fef3c7', borderBottom:'1px solid #fcd34d', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+              <span style={{ fontWeight:700, color:'#92400e', fontSize:14 }}>👑 Administrateurs</span>
+              <span style={{ background:'#92400e', color:'white', padding:'2px 10px', borderRadius:99, fontSize:12, fontWeight:700 }}>{admins.filter(matchQ).length}</span>
+            </div>
+            <div className="tbl-wrap" style={{ margin:0 }}>
+              <table className="tbl">
+                <thead><tr><th>Nom</th><th>Prénom</th><th>Email</th></tr></thead>
+                <tbody>
+                  {admins.filter(matchQ).map(u => (
+                    <tr key={u.id||u._id}>
+                      <td style={{ fontWeight:600, color:'var(--navy)' }}>{u.name}</td>
+                      <td>{u.prenom}</td>
+                      <td style={{ color:'var(--gray-400)', fontSize:12 }}>{u.email}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Professors section */}
+        {showProfs && profs.filter(matchQ).length > 0 && (
+          <div style={{ background:'white', borderRadius:12, border:'1.5px solid #93c5fd', marginBottom:20, overflow:'hidden' }}>
+            <div style={{ padding:'10px 16px', background:'#eff6ff', borderBottom:'1px solid #dbeafe', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+              <span style={{ fontWeight:700, color:'#1e40af', fontSize:14 }}>👨‍🏫 Professeurs</span>
+              <span style={{ background:'#1e40af', color:'white', padding:'2px 10px', borderRadius:99, fontSize:12, fontWeight:700 }}>{profs.filter(matchQ).length}</span>
+            </div>
+            <div className="tbl-wrap" style={{ margin:0 }}>
+              <table className="tbl">
+                <thead>
+                  <tr><th>Nom</th><th>Prénom</th><th>Email</th><th>Spécialisation</th><th>Filière</th></tr>
+                </thead>
+                <tbody>
+                  {profs.filter(matchQ).map(u => (
+                    <tr key={u.id||u._id}>
+                      <td style={{ fontWeight:600, color:'var(--navy)' }}>{u.name}</td>
+                      <td>{u.prenom}</td>
+                      <td style={{ color:'var(--gray-400)', fontSize:12 }}>{u.email}</td>
+                      <td>
+                        {u.specialization
+                          ? <span style={{ background:'#f0f9ff', color:'#0369a1', padding:'2px 8px', borderRadius:6, fontSize:12 }}>{u.specialization}</span>
+                          : <span style={{ color:'var(--gray-400)' }}>–</span>}
+                      </td>
+                      <td>
+                        {u.departement
+                          ? <span style={{ ...DEPT_COLORS[u.departement], padding:'2px 8px', borderRadius:99, fontSize:11, fontWeight:600 }}>{u.departement}</span>
+                          : <span style={{ color:'var(--gray-400)' }}>–</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Students by department */}
+        {deptGroups.map(({ dept, total, filtered }) => {
+          const dc     = DEPT_COLORS[dept] || { bg:'#f4f6fa', color:'#475569', border:'#e2e8f0' };
+          const levels = [...new Set(filtered.map(s => s.niveau).filter(Boolean))].sort();
+          return (
+            <div key={dept} style={{ background:'white', borderRadius:12, border:`1.5px solid ${dc.border}`, marginBottom:14, overflow:'hidden' }}>
+              {/* Dept header */}
+              <div style={{ padding:'10px 14px', background:dc.bg, borderBottom:`1px solid ${dc.border}`, display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:8 }}>
+                <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                  <span style={{ fontWeight:800, color:dc.color, fontSize:15 }}>{dept}</span>
+                  <div style={{ display:'flex', gap:4, flexWrap:'wrap' }}>
+                    {levels.map(lv => (
+                      <span key={lv} style={{ background:'white', color:dc.color, border:`1px solid ${dc.border}`, padding:'1px 8px', borderRadius:99, fontSize:11, fontWeight:600 }}>
+                        {lv}: {filtered.filter(s => s.niveau === lv).length}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                  <span style={{ background:dc.color, color:'white', padding:'3px 12px', borderRadius:99, fontSize:12, fontWeight:700 }}>
+                    {usersSearch ? `${filtered.length} / ${total}` : total} étudiant(s)
+                  </span>
+                  <button
+                    onClick={() => exportCSV(dept, filtered.length ? filtered : students.filter(u => u.departement === dept))}
+                    style={{ padding:'4px 11px', background:'white', border:`1.5px solid ${dc.border}`, borderRadius:7, color:dc.color, fontSize:11, fontWeight:700, cursor:'pointer' }}
+                  >
+                    ↓ CSV
+                  </button>
+                </div>
+              </div>
+              {/* Students table */}
+              {filtered.length > 0 ? (
+                <div className="tbl-wrap" style={{ margin:0, maxHeight:260, overflowY:'auto' }}>
+                  <table className="tbl">
+                    <thead>
+                      <tr><th>Nom</th><th>Prénom</th><th>Email</th><th>Niveau</th><th>Rôle</th></tr>
+                    </thead>
+                    <tbody>
+                      {filtered.map(s => (
+                        <tr key={s.id||s._id}>
+                          <td style={{ fontWeight:600, color:'var(--navy)' }}>{s.name}</td>
+                          <td>{s.prenom}</td>
+                          <td style={{ color:'var(--gray-400)', fontSize:12 }}>{s.email}</td>
+                          <td>
+                            <span style={{ background:dc.bg, color:dc.color, padding:'2px 8px', borderRadius:99, fontSize:11, fontWeight:600 }}>
+                              {s.niveau || '–'}
+                            </span>
+                          </td>
+                          <td>
+                            <span style={{ background:'#f0fdf4', color:'#166534', padding:'2px 8px', borderRadius:99, fontSize:11 }}>
+                              Étudiant
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div style={{ padding:'14px', textAlign:'center', color:'var(--gray-400)', fontSize:13 }}>
+                  Aucun résultat pour « {usersSearch} »
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   // ═══════════════════════════════════════════════════════════════════════
   //  MAIN RENDER
   // ═══════════════════════════════════════════════════════════════════════
@@ -766,6 +979,7 @@ export default function Dashboard() {
               <button className={`tab ${activeTab === 'exams'       ? 'on' : ''}`} onClick={() => setActiveTab('exams')}>📋 Calendrier</button>
               <button className={`tab ${activeTab === 'rooms'       ? 'on' : ''}`} onClick={() => { setActiveTab('rooms'); setExpandedRoom(null); }}>🏫 Salles & Planning</button>
               <button className={`tab ${activeTab === 'professors'  ? 'on' : ''}`} onClick={() => setActiveTab('professors')}>👨‍🏫 Professeurs</button>
+              <button className={`tab ${activeTab === 'utilisateurs'? 'on' : ''}`} onClick={() => setActiveTab('utilisateurs')}>👥 Utilisateurs</button>
             </>
           )}
           {exams.length > 0 && (
@@ -831,7 +1045,6 @@ export default function Dashboard() {
                 </p>
                 <ul className="schedule-rules">
                   <li><strong>Session normale</strong> · 01 – 07 juin 2026 · Semestres S1, S3, S5</li>
-                  <li><strong>Session rattrapage</strong> · 08 – 15 juin 2026 · Semestres S2, S4, S6</li>
                   <li>4 créneaux/jour · 08h–10h · 10h30–12h30 · 14h–16h · 16h30–18h30</li>
                   <li>Max <strong>7 examens / filière / semestre</strong> (priorité par crédits)</li>
                   <li>Max 2 examens / jour / étudiant · sans chevauchement</li>
@@ -943,31 +1156,49 @@ export default function Dashboard() {
                 <h3 style={{ margin:'0 0 16px', color:'var(--navy)', fontSize:16, fontWeight:700 }}>
                   👨‍🏫 Professeurs & Surveillants ({users.length})
                 </h3>
-                <table className="prof-table">
-                  <thead>
-                    <tr>
-                      <th>Nom complet</th>
-                      <th>Adresse e-mail</th>
-                      <th>Spécialisation</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {users.map(u => (
-                      <tr key={u._id || u.id}>
-                        <td style={{ fontWeight:600, color:'var(--navy)' }}>{u.name} {u.prenom}</td>
-                        <td style={{ color:'var(--gray-400)', fontSize:13 }}>{u.email}</td>
-                        <td style={{ fontSize:13 }}>
-                          {u.specialization
-                            ? <span style={{ background:'var(--gray-50)', padding:'2px 9px', borderRadius:6, border:'1px solid var(--gray-100)' }}>{u.specialization}</span>
-                            : <span style={{ color:'var(--gray-400)' }}>–</span>
-                          }
-                        </td>
+                {users.length === 0 ? (
+                  <div className="empty-state">
+                    <div className="empty-state-icon">👨‍🏫</div>
+                    <div className="empty-state-title">Aucun professeur trouvé</div>
+                  </div>
+                ) : (
+                  <table className="prof-table">
+                    <thead>
+                      <tr>
+                        <th>Nom</th>
+                        <th>Prénom</th>
+                        <th>Adresse e-mail</th>
+                        <th>Spécialisation</th>
+                        <th>Filière</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {users.map(u => (
+                        <tr key={u._id || u.id}>
+                          <td style={{ fontWeight:600, color:'var(--navy)' }}>{u.name}</td>
+                          <td>{u.prenom}</td>
+                          <td style={{ color:'var(--gray-400)', fontSize:13 }}>{u.email}</td>
+                          <td style={{ fontSize:13 }}>
+                            {u.specialization
+                              ? <span style={{ background:'var(--gray-50)', padding:'2px 9px', borderRadius:6, border:'1px solid var(--gray-100)' }}>{u.specialization}</span>
+                              : <span style={{ color:'var(--gray-400)' }}>–</span>
+                            }
+                          </td>
+                          <td>
+                            {u.departement
+                              ? <span style={{ ...DEPT_COLORS[u.departement], padding:'2px 8px', borderRadius:99, fontSize:11, fontWeight:600 }}>{u.departement}</span>
+                              : <span style={{ color:'var(--gray-400)' }}>–</span>}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
               </div>
             )}
+
+            {/* ── UTILISATEURS TAB (admin) ── */}
+            {activeTab === 'utilisateurs' && isAdmin && <UtilisateursTab />}
 
           </>
         )}

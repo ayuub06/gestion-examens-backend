@@ -48,10 +48,9 @@ const examSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 // ─── INDEXES ───────────────────────────────────────────────────────────────────
-// NOT unique — conflict detection is handled in-memory inside schedulingController.
-// The old { unique: true } was the root cause of "only 1 exam generated":
-// every save after the first in the same room+date+slot threw E11000 and was skipped.
-examSchema.index({ date: 1, heure_debut: 1, salle: 1 }); // speed only, not unique
+// Unique constraint prevents double-booking even under concurrent requests (Vercel retries).
+// The scheduler handles E11000 by syncing in-memory state and trying the next slot.
+examSchema.index({ date: 1, heure_debut: 1, salle: 1 }, { unique: true });
 examSchema.index({ surveillant: 1, date: 1 });
 examSchema.index({ department: 1, semester: 1 });
 examSchema.index({ session: 1 });
