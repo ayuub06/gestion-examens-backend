@@ -435,14 +435,14 @@ exports.autoGenerateSchedule = async (req, res) => {
             surveillantsTotal: 1 + extras.length, students: count,
           });
           console.log(`✅ [${sessionName}] ${mod.code.padEnd(12)} | ${ds} ${slot.start} | ${room.nom.padEnd(10)} | ${prof.name} ${prof.prenom} | ${count} ét.`);
-          return true;
+          return { placed: true };
         }
       }
-      // Log exactly what blocked this module across all 24 (day×slot) combinations
-      const keys = getGroupKeys(mod).join(',') || 'none';
+      // Return debug info so callers can include it in the conflicts array
+      const keys = getGroupKeys(mod);
       const stud = getStudentIds(mod).length;
-      console.warn(`❌ FAIL ${mod.code}(${mod.semester}/${mod.department}) stud:${stud} keys:[${keys}] → group:${dbgGroup} room:${dbgRoom} prof:${dbgProf} ok(blocked-by-save?):${dbgOk}`);
-      return false;
+      console.warn(`❌ FAIL ${mod.code}(${mod.semester}/${mod.department}) stud:${stud} keys:[${keys.join(',')||'none'}] → group:${dbgGroup} room:${dbgRoom} prof:${dbgProf} ok(save-fail?):${dbgOk}`);
+      return { placed:false, debug:{ keys:keys.join(',')||'none', students:stud, groupBlocked:dbgGroup, roomBlocked:dbgRoom, profBlocked:dbgProf, saveBlocked:dbgOk } };
     };
 
     const scheduleSession = async (sessionMods, sessionDates, sessionName) => {
@@ -454,26 +454,27 @@ exports.autoGenerateSchedule = async (req, res) => {
       console.log(`\n📅 [${sessionName.toUpperCase()}] ${mods.length} modules / ${numDays} jours`);
       console.log(`   Jours: ${sessionDates.map(d=>d.toISOString().split('T')[0]).join(', ')}`);
 
-      let pending = [...mods];
+      // pendingWithDebug: each entry = { mod, debug } where debug comes from the last failed attempt
+      let pendingWithDebug = mods.map(mod => ({ mod, debug: null }));
       let pass = 1;
 
       // Multi-pass: retry unplaced modules up to 4 times.
       // Load-balanced day selection spreads exams evenly; extra passes resolve
       // any residual ordering effects.
-      while (pending.length > 0 && pass <= 4) {
-        console.log(`\n🔄 Pass ${pass} — ${pending.length} module(s) à placer`);
+      while (pendingWithDebug.length > 0 && pass <= 4) {
+        console.log(`\n🔄 Pass ${pass} — ${pendingWithDebug.length} module(s) à placer`);
         const stillPending = [];
-        for (const mod of pending) {
-          const placed = await tryPlaceMod(mod, sessionDates, sessionName);
-          if (!placed) stillPending.push(mod);
+        for (const { mod } of pendingWithDebug) {
+          const result = await tryPlaceMod(mod, sessionDates, sessionName);
+          if (!result.placed) stillPending.push({ mod, debug: result.debug });
         }
-        if (stillPending.length === pending.length) break; // no progress → stop
-        pending = stillPending;
+        if (stillPending.length === pendingWithDebug.length) break; // no progress → stop
+        pendingWithDebug = stillPending;
         pass++;
       }
 
-      for (const mod of pending) {
-        conflicts.push({ module: mod.code, semester: mod.semester, reason: 'Plus de créneaux disponibles' });
+      for (const { mod, debug } of pendingWithDebug) {
+        conflicts.push({ module: mod.code, semester: mod.semester, reason: 'Plus de créneaux disponibles', debug });
         console.warn(`⚠️  [${sessionName}] ${mod.code} (${mod.semester}) — aucun créneau trouvé après ${pass-1} pass(es)`);
       }
     };
