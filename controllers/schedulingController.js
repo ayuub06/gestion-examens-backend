@@ -348,140 +348,116 @@ exports.autoGenerateSchedule = async (req, res) => {
     const scheduledExams = [];
     const conflicts      = [];
 
+    // Attempt to place a single module; returns true if placed, false otherwise
+    const tryPlaceMod = async (mod, sessionDates, sessionName, modIdx) => {
+      const numDays = sessionDates.length;
+      const startDayIdx = modIdx % numDays;
+
+      for (let di = 0; di < numDays; di++) {
+        const date = sessionDates[(startDayIdx + di) % numDays];
+        const ds   = date.toISOString().split('T')[0];
+
+        for (const slot of TIME_SLOTS) {
+          if (!isGroupFree(mod, ds, slot.start)) continue;
+
+          const studentIds = getStudentIds(mod);
+          const count      = studentIds.length || 30;
+          const isCommon   = mod.department === 'COMMON';
+          const room       = pickRoom(mod.examType || 'theorique', count, ds, slot.start, slot.end, isCommon);
+          if (!room) continue;
+
+          const prof = pickProf(ds, slot.start);
+          if (!prof) continue;
+
+          const needed = ROOM_SURVEILLANTS[room.type] || 1;
+          const extraCandidates = [];
+          const sortedForExtra = [...professors].sort((a, b) =>
+            (profTotal[a._id.toString()] || 0) - (profTotal[b._id.toString()] || 0)
+          );
+          for (const p of sortedForExtra) {
+            if (extraCandidates.length >= needed - 1) break;
+            if (p._id.toString() === prof._id.toString()) continue;
+            if (isProfFree(p._id.toString(), ds, slot.start)) extraCandidates.push(p);
+          }
+          const extras = extraCandidates.map(p => p._id);
+
+          const etudiantOids = studentIds.map(id => {
+            try { return new mongoose.Types.ObjectId(id.toString()); } catch { return null; }
+          }).filter(Boolean);
+
+          const exam = new Exam({
+            module:      mod.name,
+            code_module: mod.code,
+            date,
+            heure_debut: slot.start,
+            heure_fin:   slot.end,
+            salle:       room._id,
+            surveillant: prof._id,
+            surveillants:[prof._id, ...extras],
+            etudiants:   etudiantOids,
+            type:        'exam',
+            nombre_etudiants: count,
+            department:  mod.department || 'GI',
+            semester:    mod.semester   || 'S1',
+            session:     sessionName,
+          });
+
+          try { await exam.save(); }
+          catch (se) {
+            if (se.code === 11000) { markRoom(room._id.toString(), ds, slot.start, slot.end); continue; }
+            throw se;
+          }
+
+          markProf(prof._id.toString(), ds, slot.start);
+          markRoom(room._id.toString(), ds, slot.start, slot.end);
+          for (const p of extraCandidates) markProf(p._id.toString(), ds, slot.start);
+          markGroup(mod, ds, slot.start);
+
+          scheduledExams.push({
+            module:   mod.name, code: mod.code, dept: mod.department,
+            semester: mod.semester, session: sessionName,
+            date: ds, time: `${slot.start}–${slot.end}`,
+            room: room.nom, roomType: room.type,
+            supervisor: `${prof.name} ${prof.prenom}`,
+            surveillantsTotal: 1 + extras.length, students: count,
+          });
+          console.log(`✅ [${sessionName}] ${mod.code.padEnd(12)} | ${ds} ${slot.start} | ${room.nom.padEnd(10)} | ${prof.name} ${prof.prenom} | ${count} ét.`);
+          return true;
+        }
+      }
+      return false;
+    };
+
     const scheduleSession = async (sessionMods, sessionDates, sessionName) => {
       // COMMON modules first so shared group slots are claimed before dept-specific ones
-      const common = shuffle(sessionMods.filter(m => m.department === 'COMMON'));
+      const common      = shuffle(sessionMods.filter(m => m.department === 'COMMON'));
       const deptSpecific = shuffle(sessionMods.filter(m => m.department !== 'COMMON'));
       const mods = [...common, ...deptSpecific];
       const numDays = sessionDates.length;
       console.log(`\n📅 [${sessionName.toUpperCase()}] ${mods.length} modules / ${numDays} jours`);
       console.log(`   Jours: ${sessionDates.map(d=>d.toISOString().split('T')[0]).join(', ')}`);
 
-      for (let mi = 0; mi < mods.length; mi++) {
-        const mod     = mods[mi];
-        let   placed  = false;
+      let pending = mods.map((mod, i) => ({ mod, idx: i }));
+      let pass = 1;
 
-        // Rotate starting day to spread exams across the full period
-        const startDayIdx = mi % numDays;
-
-        dayLoop:
-        for (let di = 0; di < numDays && !placed; di++) {
-          const date = sessionDates[(startDayIdx + di) % numDays];
-          const ds   = date.toISOString().split('T')[0];
-
-          for (const slot of TIME_SLOTS) {
-            // 1. Check student group constraints
-            if (!isGroupFree(mod, ds, slot.start)) continue;
-
-            // 2. Find a free room with enough capacity
-            const studentIds = getStudentIds(mod);
-            const count      = studentIds.length || 30;
-            const isCommon   = mod.department === 'COMMON';
-            const room       = pickRoom(mod.examType || 'theorique', count, ds, slot.start, slot.end, isCommon);
-            if (!room) continue;
-
-            // 3. Find a free professor (slot-based global check)
-            const prof = pickProf(ds, slot.start);
-            if (!prof) continue;
-
-            // 4. Gather co-surveillant candidates (least-loaded first)
-            //    Each candidate is verified against the global slotBusy map so no
-            //    professor can appear in two different rooms at the same time.
-            const needed = ROOM_SURVEILLANTS[room.type] || 1;
-            const extraCandidates = [];
-            const sortedForExtra = [...professors].sort((a, b) =>
-              (profTotal[a._id.toString()] || 0) - (profTotal[b._id.toString()] || 0)
-            );
-            for (const p of sortedForExtra) {
-              if (extraCandidates.length >= needed - 1) break;
-              if (p._id.toString() === prof._id.toString()) continue;
-              if (isProfFree(p._id.toString(), ds, slot.start)) {
-                extraCandidates.push(p);
-              }
-            }
-            const extras = extraCandidates.map(p => p._id);
-
-            // 5. Convert IDs and save exam
-            const etudiantOids = studentIds.map(id => {
-              try { return new mongoose.Types.ObjectId(id.toString()); } catch { return null; }
-            }).filter(Boolean);
-
-            const exam = new Exam({
-              module:      mod.name,
-              code_module: mod.code,
-              date,
-              heure_debut: slot.start,
-              heure_fin:   slot.end,
-              salle:       room._id,
-              surveillant: prof._id,
-              surveillants:[prof._id, ...extras],
-              etudiants:   etudiantOids,
-              type:        'exam',
-              nombre_etudiants: count,
-              department:  mod.department || 'GI',
-              semester:    mod.semester   || 'S1',
-              session:     sessionName,
-            });
-
-            try { await exam.save(); }
-            catch (se) {
-              if (se.code === 11000) {
-                // Room was taken by a concurrent request — sync in-memory and try next slot
-                markRoom(room._id.toString(), ds, slot.start, slot.end);
-                continue;
-              }
-              throw se;
-            }
-
-            // 6. Mark ALL trackers AFTER successful save (no risk of poisoning on failure)
-            markProf(prof._id.toString(), ds, slot.start);
-            markRoom(room._id.toString(), ds, slot.start, slot.end);
-            for (const p of extraCandidates) markProf(p._id.toString(), ds, slot.start);
-            markGroup(mod, ds, slot.start);
-
-            scheduledExams.push({
-              module:    mod.name,
-              code:      mod.code,
-              dept:      mod.department,
-              semester:  mod.semester,
-              session:   sessionName,
-              date:      ds,
-              time:      `${slot.start}–${slot.end}`,
-              room:      room.nom,
-              roomType:  room.type,
-              supervisor:`${prof.name} ${prof.prenom}`,
-              surveillantsTotal: 1 + extras.length,
-              students:  count,
-            });
-
-            console.log(`✅ [${sessionName}] ${mod.code.padEnd(12)} | ${ds} ${slot.start} | ${room.nom.padEnd(10)} | ${prof.name} ${prof.prenom} | ${count} ét.`);
-            placed = true;
-            break;
-          }
+      // Multi-pass: retry unplaced modules up to 4 times.
+      // Ordering effects (first-come-first-served) mean some modules miss slots
+      // that become "available" relative to later placements; extra passes resolve this.
+      while (pending.length > 0 && pass <= 4) {
+        console.log(`\n🔄 Pass ${pass} — ${pending.length} module(s) à placer`);
+        const stillPending = [];
+        for (const { mod, idx } of pending) {
+          const placed = await tryPlaceMod(mod, sessionDates, sessionName, idx);
+          if (!placed) stillPending.push({ mod, idx });
         }
+        if (stillPending.length === pending.length) break; // no progress → stop
+        pending = stillPending;
+        pass++;
+      }
 
-        if (!placed) {
-          // Diagnose the exact blocking constraint for this module
-          let reasons = [];
-          for (let di = 0; di < numDays; di++) {
-            const date = sessionDates[di];
-            const ds2  = date.toISOString().split('T')[0];
-            for (const slot of TIME_SLOTS) {
-              if (!isGroupFree(mod, ds2, slot.start)) { reasons.push(`group@${ds2}_${slot.start}`); continue; }
-              const sIds = getStudentIds(mod);
-              const cnt  = sIds.length || 30;
-              const r    = pickRoom(mod.examType || 'theorique', cnt, ds2, slot.start, slot.end, mod.department === 'COMMON');
-              if (!r) { reasons.push(`noRoom@${ds2}_${slot.start}`); continue; }
-              const freeProfs = professors.filter(p => isProfFree(p._id.toString(), ds2, slot.start)).length;
-              if (!freeProfs) { reasons.push(`noProf@${ds2}_${slot.start}`); }
-            }
-          }
-          const groupBlocked = reasons.filter(r=>r.startsWith('group')).length;
-          const roomBlocked  = reasons.filter(r=>r.startsWith('noRoom')).length;
-          const profBlocked  = reasons.filter(r=>r.startsWith('noProf')).length;
-          console.warn(`⚠️  [${sessionName}] ${mod.code} (${mod.sem||mod.semester}) — group:${groupBlocked} room:${roomBlocked} prof:${profBlocked} / 24 slots`);
-          conflicts.push({ module:mod.code, semester:mod.semester, reason:'Plus de créneaux disponibles', debug:{groupBlocked,roomBlocked,profBlocked} });
-        }
+      for (const { mod } of pending) {
+        conflicts.push({ module: mod.code, semester: mod.semester, reason: 'Plus de créneaux disponibles' });
+        console.warn(`⚠️  [${sessionName}] ${mod.code} (${mod.semester}) — aucun créneau trouvé après ${pass-1} pass(es)`);
       }
     };
 
