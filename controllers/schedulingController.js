@@ -261,15 +261,19 @@ exports.autoGenerateSchedule = async (req, res) => {
     };
 
     // In-memory busy trackers
-    const profBusy  = {}; // profBusy[profId][ds] = [{start,end}]
-    const roomBusy  = {}; // roomBusy[roomId][ds] = [{start,end}]
-    const groupSlot = {}; // groupSlot[groupKey][ds+slot] = true  (overlap prevention)
-    const groupDay  = {}; // groupDay[groupKey][ds] = count       (max 2/day)
+    // slotBusy: global per-(date,slot) → Set of profIds already assigned across ALL rooms
+    const slotBusy   = {}; // slotBusy[`${ds}_${slotStart}`] = Set<profId>
+    const profDayCnt = {}; // profDayCnt[profId][ds] = count (for max-2-per-day limit)
+    const roomBusy   = {}; // roomBusy[roomId][ds] = [{start,end}]
+    const groupSlot  = {}; // groupSlot[groupKey][ds+slot] = true  (overlap prevention)
+    const groupDay   = {}; // groupDay[groupKey][ds] = count       (max 2/day)
 
-    const isProfFree = (id, ds, s, e) => {
-      const sl = profBusy[id]?.[ds] || [];
-      if (sl.length >= 2) return false; // max 2 surveillances per day per professor
-      return !sl.some(x => overlaps(s, e, x.start, x.end));
+    // A professor is free at a slot if they don't appear in the global slotBusy set
+    // and haven't exceeded 2 surveillances that day
+    const isProfFree = (id, ds, s) => {
+      const key = `${ds}_${s}`;
+      if ((profDayCnt[id]?.[ds] || 0) >= 2) return false;
+      return !(slotBusy[key]?.has(id));
     };
 
     const isRoomFree = (id, ds, s, e) =>
@@ -285,10 +289,12 @@ exports.autoGenerateSchedule = async (req, res) => {
       });
     };
 
-    const markProf = (id, ds, s, e) => {
-      if (!profBusy[id])     profBusy[id]     = {};
-      if (!profBusy[id][ds]) profBusy[id][ds] = [];
-      profBusy[id][ds].push({ start:s, end:e });
+    const markProf = (id, ds, s) => {
+      const key = `${ds}_${s}`;
+      if (!slotBusy[key]) slotBusy[key] = new Set();
+      slotBusy[key].add(id);
+      if (!profDayCnt[id]) profDayCnt[id] = {};
+      profDayCnt[id][ds] = (profDayCnt[id][ds] || 0) + 1;
       profTotal[id] = (profTotal[id] || 0) + 1;
     };
     const markRoom = (id, ds, s, e) => {
@@ -310,15 +316,16 @@ exports.autoGenerateSchedule = async (req, res) => {
     const profTotal = {};
     professors.forEach(p => { profTotal[p._id.toString()] = 0; });
 
-    const pickProf = (ds, s, e) => {
+    const pickProf = (ds, s) => {
       const sorted = [...professors].sort((a, b) =>
         (profTotal[a._id.toString()] || 0) - (profTotal[b._id.toString()] || 0)
       );
-      return sorted.find(p => isProfFree(p._id.toString(), ds, s, e)) || null;
+      return sorted.find(p => isProfFree(p._id.toString(), ds, s)) || null;
     };
 
-    const pickRoom = (examType, count, ds, s, e) => {
-      const pref  = pickRoomType(examType, count);
+    // isCommon=true forces amphi so COMMON modules always get the biggest room
+    const pickRoom = (examType, count, ds, s, e, isCommon) => {
+      const pref  = isCommon ? 'amphi' : pickRoomType(examType, count);
       const order = ROOM_FALLBACK[pref] || [pref];
       // Sort by total bookings ascending so least-used rooms are tried first
       const byUsage = [...rooms].sort((a, b) => {
@@ -368,14 +375,17 @@ exports.autoGenerateSchedule = async (req, res) => {
             // 2. Find a free room with enough capacity
             const studentIds = getStudentIds(mod);
             const count      = studentIds.length || 30;
-            const room       = pickRoom(mod.examType || 'theorique', count, ds, slot.start, slot.end);
+            const isCommon   = mod.department === 'COMMON';
+            const room       = pickRoom(mod.examType || 'theorique', count, ds, slot.start, slot.end, isCommon);
             if (!room) continue;
 
-            // 3. Find a free professor
-            const prof = pickProf(ds, slot.start, slot.end);
+            // 3. Find a free professor (slot-based global check)
+            const prof = pickProf(ds, slot.start);
             if (!prof) continue;
 
             // 4. Gather co-surveillant candidates (least-loaded first)
+            //    Each candidate is verified against the global slotBusy map so no
+            //    professor can appear in two different rooms at the same time.
             const needed = ROOM_SURVEILLANTS[room.type] || 1;
             const extraCandidates = [];
             const sortedForExtra = [...professors].sort((a, b) =>
@@ -384,7 +394,7 @@ exports.autoGenerateSchedule = async (req, res) => {
             for (const p of sortedForExtra) {
               if (extraCandidates.length >= needed - 1) break;
               if (p._id.toString() === prof._id.toString()) continue;
-              if (isProfFree(p._id.toString(), ds, slot.start, slot.end)) {
+              if (isProfFree(p._id.toString(), ds, slot.start)) {
                 extraCandidates.push(p);
               }
             }
@@ -423,9 +433,9 @@ exports.autoGenerateSchedule = async (req, res) => {
             }
 
             // 6. Mark ALL trackers AFTER successful save (no risk of poisoning on failure)
-            markProf(prof._id.toString(), ds, slot.start, slot.end);
+            markProf(prof._id.toString(), ds, slot.start);
             markRoom(room._id.toString(), ds, slot.start, slot.end);
-            for (const p of extraCandidates) markProf(p._id.toString(), ds, slot.start, slot.end);
+            for (const p of extraCandidates) markProf(p._id.toString(), ds, slot.start);
             markGroup(mod, ds, slot.start);
 
             scheduledExams.push({
