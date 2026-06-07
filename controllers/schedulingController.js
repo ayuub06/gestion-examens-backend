@@ -363,20 +363,23 @@ exports.autoGenerateSchedule = async (req, res) => {
         return (dayLoad[da] || 0) - (dayLoad[db] || 0);
       });
 
+      let dbgGroup = 0, dbgRoom = 0, dbgProf = 0, dbgOk = 0;
+
       for (const date of sortedDates) {
         const ds = date.toISOString().split('T')[0];
 
         for (const slot of TIME_SLOTS) {
-          if (!isGroupFree(mod, ds, slot.start)) continue;
+          if (!isGroupFree(mod, ds, slot.start)) { dbgGroup++; continue; }
 
           const studentIds = getStudentIds(mod);
           const count      = studentIds.length || 30;
           const isCommon   = mod.department === 'COMMON';
           const room       = pickRoom(mod.examType || 'theorique', count, ds, slot.start, slot.end, isCommon);
-          if (!room) continue;
+          if (!room) { dbgRoom++; continue; }
 
           const prof = pickProf(ds, slot.start);
-          if (!prof) continue;
+          if (!prof) { dbgProf++; continue; }
+          dbgOk++; // passed all checks — will attempt save
 
           const needed = ROOM_SURVEILLANTS[room.type] || 1;
           const extraCandidates = [];
@@ -435,6 +438,10 @@ exports.autoGenerateSchedule = async (req, res) => {
           return true;
         }
       }
+      // Log exactly what blocked this module across all 24 (day×slot) combinations
+      const keys = getGroupKeys(mod).join(',') || 'none';
+      const stud = getStudentIds(mod).length;
+      console.warn(`❌ FAIL ${mod.code}(${mod.semester}/${mod.department}) stud:${stud} keys:[${keys}] → group:${dbgGroup} room:${dbgRoom} prof:${dbgProf} ok(blocked-by-save?):${dbgOk}`);
       return false;
     };
 
