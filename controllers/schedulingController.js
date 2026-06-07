@@ -461,8 +461,26 @@ exports.autoGenerateSchedule = async (req, res) => {
         }
 
         if (!placed) {
-          conflicts.push({ module:mod.code, semester:mod.semester, reason:'Plus de créneaux disponibles' });
-          console.warn(`⚠️  [${sessionName}] ${mod.code} (${mod.semester}) — aucun créneau trouvé`);
+          // Diagnose the exact blocking constraint for this module
+          let reasons = [];
+          for (let di = 0; di < numDays; di++) {
+            const date = sessionDates[di];
+            const ds2  = date.toISOString().split('T')[0];
+            for (const slot of TIME_SLOTS) {
+              if (!isGroupFree(mod, ds2, slot.start)) { reasons.push(`group@${ds2}_${slot.start}`); continue; }
+              const sIds = getStudentIds(mod);
+              const cnt  = sIds.length || 30;
+              const r    = pickRoom(mod.examType || 'theorique', cnt, ds2, slot.start, slot.end, mod.department === 'COMMON');
+              if (!r) { reasons.push(`noRoom@${ds2}_${slot.start}`); continue; }
+              const freeProfs = professors.filter(p => isProfFree(p._id.toString(), ds2, slot.start)).length;
+              if (!freeProfs) { reasons.push(`noProf@${ds2}_${slot.start}`); }
+            }
+          }
+          const groupBlocked = reasons.filter(r=>r.startsWith('group')).length;
+          const roomBlocked  = reasons.filter(r=>r.startsWith('noRoom')).length;
+          const profBlocked  = reasons.filter(r=>r.startsWith('noProf')).length;
+          console.warn(`⚠️  [${sessionName}] ${mod.code} (${mod.sem||mod.semester}) — group:${groupBlocked} room:${roomBlocked} prof:${profBlocked} / 24 slots`);
+          conflicts.push({ module:mod.code, semester:mod.semester, reason:'Plus de créneaux disponibles', debug:{groupBlocked,roomBlocked,profBlocked} });
         }
       }
     };
