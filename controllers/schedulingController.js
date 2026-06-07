@@ -347,15 +347,19 @@ exports.autoGenerateSchedule = async (req, res) => {
     // ── Step 6: core scheduler ─────────────────────────────────────────────
     const scheduledExams = [];
     const conflicts      = [];
+    const dayLoad        = {}; // dayLoad[ds] = number of exams scheduled that day
 
     // Attempt to place a single module; returns true if placed, false otherwise
-    const tryPlaceMod = async (mod, sessionDates, sessionName, modIdx) => {
-      const numDays = sessionDates.length;
-      const startDayIdx = modIdx % numDays;
+    const tryPlaceMod = async (mod, sessionDates, sessionName) => {
+      // Try days in order of ascending load so exams spread evenly across the period
+      const sortedDates = [...sessionDates].sort((a, b) => {
+        const da = a.toISOString().split('T')[0];
+        const db = b.toISOString().split('T')[0];
+        return (dayLoad[da] || 0) - (dayLoad[db] || 0);
+      });
 
-      for (let di = 0; di < numDays; di++) {
-        const date = sessionDates[(startDayIdx + di) % numDays];
-        const ds   = date.toISOString().split('T')[0];
+      for (const date of sortedDates) {
+        const ds = date.toISOString().split('T')[0];
 
         for (const slot of TIME_SLOTS) {
           if (!isGroupFree(mod, ds, slot.start)) continue;
@@ -412,6 +416,7 @@ exports.autoGenerateSchedule = async (req, res) => {
           markRoom(room._id.toString(), ds, slot.start, slot.end);
           for (const p of extraCandidates) markProf(p._id.toString(), ds, slot.start);
           markGroup(mod, ds, slot.start);
+          dayLoad[ds] = (dayLoad[ds] || 0) + 1; // track daily load for balanced spreading
 
           scheduledExams.push({
             module:   mod.name, code: mod.code, dept: mod.department,
@@ -437,25 +442,25 @@ exports.autoGenerateSchedule = async (req, res) => {
       console.log(`\n📅 [${sessionName.toUpperCase()}] ${mods.length} modules / ${numDays} jours`);
       console.log(`   Jours: ${sessionDates.map(d=>d.toISOString().split('T')[0]).join(', ')}`);
 
-      let pending = mods.map((mod, i) => ({ mod, idx: i }));
+      let pending = [...mods];
       let pass = 1;
 
       // Multi-pass: retry unplaced modules up to 4 times.
-      // Ordering effects (first-come-first-served) mean some modules miss slots
-      // that become "available" relative to later placements; extra passes resolve this.
+      // Load-balanced day selection spreads exams evenly; extra passes resolve
+      // any residual ordering effects.
       while (pending.length > 0 && pass <= 4) {
         console.log(`\n🔄 Pass ${pass} — ${pending.length} module(s) à placer`);
         const stillPending = [];
-        for (const { mod, idx } of pending) {
-          const placed = await tryPlaceMod(mod, sessionDates, sessionName, idx);
-          if (!placed) stillPending.push({ mod, idx });
+        for (const mod of pending) {
+          const placed = await tryPlaceMod(mod, sessionDates, sessionName);
+          if (!placed) stillPending.push(mod);
         }
         if (stillPending.length === pending.length) break; // no progress → stop
         pending = stillPending;
         pass++;
       }
 
-      for (const { mod } of pending) {
+      for (const mod of pending) {
         conflicts.push({ module: mod.code, semester: mod.semester, reason: 'Plus de créneaux disponibles' });
         console.warn(`⚠️  [${sessionName}] ${mod.code} (${mod.semester}) — aucun créneau trouvé après ${pass-1} pass(es)`);
       }
