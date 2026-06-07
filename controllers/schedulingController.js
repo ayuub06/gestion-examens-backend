@@ -268,11 +268,12 @@ exports.autoGenerateSchedule = async (req, res) => {
     const groupSlot  = {}; // groupSlot[groupKey][ds+slot] = true  (overlap prevention)
     const groupDay   = {}; // groupDay[groupKey][ds] = count       (max 2/day)
 
-    // A professor is free at a slot if they don't appear in the global slotBusy set
-    // and haven't exceeded 2 surveillances that day
+    // A professor is free at a slot if they don't appear in the global slotBusy set.
+    // Daily limit = 4 (one per time-slot) so professors can cover all 4 daily slots;
+    // this is necessary given the small professor pool relative to module count.
     const isProfFree = (id, ds, s) => {
       const key = `${ds}_${s}`;
-      if ((profDayCnt[id]?.[ds] || 0) >= 2) return false;
+      if ((profDayCnt[id]?.[ds] || 0) >= 4) return false;
       return !(slotBusy[key]?.has(id));
     };
 
