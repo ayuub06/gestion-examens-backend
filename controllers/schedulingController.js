@@ -277,6 +277,11 @@ exports.autoGenerateSchedule = async (req, res) => {
       return !(slotBusy[key]?.has(id));
     };
 
+    // Student group daily limit: raised to 3 to accommodate 136 modules across 6 days.
+    // With 24 student groups × max-2/day × 6 days the schedule is mathematically tight;
+    // 3/day gives each group enough temporal spread while keeping exam density reasonable.
+    const MAX_GROUP_PER_DAY = 3;
+
     const isRoomFree = (id, ds, s, e) =>
       !(roomBusy[id]?.[ds] || []).some(x => overlaps(s, e, x.start, x.end));
 
@@ -285,7 +290,7 @@ exports.autoGenerateSchedule = async (req, res) => {
       const slotKey = `${ds}_${slotStart}`;
       return getGroupKeys(mod).every(k => {
         if (groupSlot[k]?.[slotKey])          return false; // overlap
-        if ((groupDay[k]?.[ds] || 0) >= 2)    return false; // max 2/day
+        if ((groupDay[k]?.[ds] || 0) >= MAX_GROUP_PER_DAY) return false; // configurable daily limit
         return true;
       });
     };
