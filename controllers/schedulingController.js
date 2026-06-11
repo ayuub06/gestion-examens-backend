@@ -44,8 +44,11 @@ const SEM_TO_NIVEAU = {
 
 const ROOM_SURVEILLANTS = { amphi:3, grande_salle:2, petite_salle:1, labo:1 };
 
-const pickRoomType = (examType, count) => {
+const LABO_KEYWORDS = /\b(atelier|stage|labo|tp)\b/i;
+
+const pickRoomType = (examType, count, moduleName) => {
   if (examType === 'pratique') return 'labo';
+  if (moduleName && LABO_KEYWORDS.test(moduleName)) return 'labo';
   if (count > 80)  return 'amphi';
   if (count > 30)  return 'grande_salle';
   return 'petite_salle';
@@ -262,18 +265,20 @@ exports.autoGenerateSchedule = async (req, res) => {
 
     // In-memory busy trackers
     // slotBusy: global per-(date,slot) → Set of profIds already assigned across ALL rooms
-    const slotBusy   = {}; // slotBusy[`${ds}_${slotStart}`] = Set<profId>
-    const profDayCnt = {}; // profDayCnt[profId][ds] = count (for max-2-per-day limit)
-    const roomBusy   = {}; // roomBusy[roomId][ds] = [{start,end}]
-    const groupSlot  = {}; // groupSlot[groupKey][ds+slot] = true  (overlap prevention)
-    const groupDay   = {}; // groupDay[groupKey][ds] = count       (max 2/day)
+    const slotBusy     = {}; // slotBusy[`${ds}_${slotStart}`] = Set<profId>
+    const profDayCount = {}; // profDayCount[profId][ds] = count (max-2-per-day limit)
+    const roomBusy     = {}; // roomBusy[roomId][ds] = [{start,end}]
+    const groupSlot    = {}; // groupSlot[groupKey][ds+slot] = true  (overlap prevention)
+    const groupDay     = {}; // groupDay[groupKey][ds] = count       (max 2/day)
 
-    // A professor is free at a slot if they don't appear in the global slotBusy set.
-    // Daily limit = 4 (one per time-slot) so professors can cover all 4 daily slots;
-    // this is necessary given the small professor pool relative to module count.
+    const MAX_PROF_TOTAL = 10; // max 10 total surveillances per professor
+    const MAX_PROF_DAY   = 2;  // max 2 exams per day per professor
+
+    // Check BEFORE assigning: professor must be free at this slot, under daily cap, and under total cap
     const isProfFree = (id, ds, s) => {
       const key = `${ds}_${s}`;
-      if ((profDayCnt[id]?.[ds] || 0) >= 4) return false;
+      if ((profTotal[id] || 0) >= MAX_PROF_TOTAL) return false;
+      if ((profDayCount[id]?.[ds] || 0) >= MAX_PROF_DAY) return false;
       return !(slotBusy[key]?.has(id));
     };
 
@@ -299,8 +304,8 @@ exports.autoGenerateSchedule = async (req, res) => {
       const key = `${ds}_${s}`;
       if (!slotBusy[key]) slotBusy[key] = new Set();
       slotBusy[key].add(id);
-      if (!profDayCnt[id]) profDayCnt[id] = {};
-      profDayCnt[id][ds] = (profDayCnt[id][ds] || 0) + 1;
+      if (!profDayCount[id]) profDayCount[id] = {};
+      profDayCount[id][ds] = (profDayCount[id][ds] || 0) + 1;
       profTotal[id] = (profTotal[id] || 0) + 1;
     };
     const markRoom = (id, ds, s, e) => {
@@ -330,8 +335,8 @@ exports.autoGenerateSchedule = async (req, res) => {
     };
 
     // isCommon=true forces amphi so COMMON modules always get the biggest room
-    const pickRoom = (examType, count, ds, s, e, isCommon) => {
-      const pref  = isCommon ? 'amphi' : pickRoomType(examType, count);
+    const pickRoom = (examType, count, ds, s, e, isCommon, moduleName) => {
+      const pref  = isCommon ? 'amphi' : pickRoomType(examType, count, moduleName);
       const order = ROOM_FALLBACK[pref] || [pref];
       // Sort by total bookings ascending so least-used rooms are tried first
       const byUsage = [...rooms].sort((a, b) => {
@@ -374,24 +379,34 @@ exports.autoGenerateSchedule = async (req, res) => {
           const studentIds = getStudentIds(mod);
           const count      = studentIds.length || 30;
           const isCommon   = mod.department === 'COMMON';
-          const room       = pickRoom(mod.examType || 'theorique', count, ds, slot.start, slot.end, isCommon);
+          const room       = pickRoom(mod.examType || 'theorique', count, ds, slot.start, slot.end, isCommon, mod.name);
           if (!room) { dbgRoom++; continue; }
 
-          const prof = pickProf(ds, slot.start);
-          if (!prof) { dbgProf++; continue; }
+          const needed = ROOM_SURVEILLANTS[room.type] || 1;
+
+          // Pick main professor — checked free at slot + under daily/total caps
+          const mainProf = pickProf(ds, slot.start);
+          if (!mainProf) { dbgProf++; continue; }
           dbgOk++; // passed all checks — will attempt save
 
-          const needed = ROOM_SURVEILLANTS[room.type] || 1;
-          const extraCandidates = [];
-          const sortedForExtra = [...professors].sort((a, b) =>
-            (profTotal[a._id.toString()] || 0) - (profTotal[b._id.toString()] || 0)
-          );
-          for (const p of sortedForExtra) {
-            if (extraCandidates.length >= needed - 1) break;
-            if (p._id.toString() === prof._id.toString()) continue;
-            if (isProfFree(p._id.toString(), ds, slot.start)) extraCandidates.push(p);
+          // Track all professors selected for THIS exam so co-surveillants cannot duplicate,
+          // even before slotBusy is updated (which only happens after save)
+          const pickedIds = new Set([mainProf._id.toString()]);
+          const coSurvs   = [];
+
+          if (needed > 1) {
+            const byLoad = [...professors].sort((a, b) =>
+              (profTotal[a._id.toString()] || 0) - (profTotal[b._id.toString()] || 0)
+            );
+            for (const p of byLoad) {
+              if (coSurvs.length >= needed - 1) break;
+              const pid = p._id.toString();
+              if (pickedIds.has(pid)) continue;            // already in this exam
+              if (!isProfFree(pid, ds, slot.start)) continue; // busy / over daily or total cap
+              coSurvs.push(p);
+              pickedIds.add(pid); // prevent duplicate within same exam before slotBusy updates
+            }
           }
-          const extras = extraCandidates.map(p => p._id);
 
           const etudiantOids = studentIds.map(id => {
             try { return new mongoose.Types.ObjectId(id.toString()); } catch { return null; }
@@ -404,8 +419,8 @@ exports.autoGenerateSchedule = async (req, res) => {
             heure_debut: slot.start,
             heure_fin:   slot.end,
             salle:       room._id,
-            surveillant: prof._id,
-            surveillants:[prof._id, ...extras],
+            surveillant:  mainProf._id,
+            surveillants: [mainProf._id, ...coSurvs.map(p => p._id)],
             etudiants:   etudiantOids,
             type:        'exam',
             nombre_etudiants: count,
@@ -420,21 +435,21 @@ exports.autoGenerateSchedule = async (req, res) => {
             throw se;
           }
 
-          markProf(prof._id.toString(), ds, slot.start);
+          // Mark ALL surveillants immediately before processing next exam
+          for (const p of [mainProf, ...coSurvs]) markProf(p._id.toString(), ds, slot.start);
           markRoom(room._id.toString(), ds, slot.start, slot.end);
-          for (const p of extraCandidates) markProf(p._id.toString(), ds, slot.start);
           markGroup(mod, ds, slot.start);
-          dayLoad[ds] = (dayLoad[ds] || 0) + 1; // track daily load for balanced spreading
+          dayLoad[ds] = (dayLoad[ds] || 0) + 1;
 
           scheduledExams.push({
             module:   mod.name, code: mod.code, dept: mod.department,
             semester: mod.semester, session: sessionName,
             date: ds, time: `${slot.start}–${slot.end}`,
             room: room.nom, roomType: room.type,
-            supervisor: `${prof.name} ${prof.prenom}`,
-            surveillantsTotal: 1 + extras.length, students: count,
+            supervisor: `${mainProf.name} ${mainProf.prenom}`,
+            surveillantsTotal: 1 + coSurvs.length, students: count,
           });
-          console.log(`✅ [${sessionName}] ${mod.code.padEnd(12)} | ${ds} ${slot.start} | ${room.nom.padEnd(10)} | ${prof.name} ${prof.prenom} | ${count} ét.`);
+          console.log(`✅ [${sessionName}] ${mod.code.padEnd(12)} | ${ds} ${slot.start} | ${room.nom.padEnd(10)} | ${mainProf.name} ${mainProf.prenom} | ${count} ét. | surv:${1+coSurvs.length}/${needed}`);
           return { placed: true };
         }
       }
@@ -499,17 +514,42 @@ exports.autoGenerateSchedule = async (req, res) => {
     }
 
     console.log(`\n✅ Planifiés : ${scheduledExams.length} / ${schedulableMods.length} (${allModules.length} total avant cap)`);
-    console.log(`⚠️  Conflits  : ${conflicts.length}`);
+    console.log(`⚠️  Non placés : ${conflicts.length}`);
+
+    // ── Post-generation surveillance conflict verification ─────────────────
+    const savedExams = await Exam.find({ session:'normale' }).populate('surveillants','_id name prenom');
+    const survSlots  = {};
+    for (const ex of savedExams) {
+      const ds  = ex.date.toISOString().split('T')[0];
+      const sk  = `${ds}_${ex.heure_debut}`;
+      for (const p of (ex.surveillants || [])) {
+        if (!p?._id) continue;
+        const key = `${p._id}_${sk}`;
+        if (!survSlots[key]) survSlots[key] = { name:`${p.name} ${p.prenom}`, modules:[] };
+        if (!survSlots[key].modules.includes(ex.module)) survSlots[key].modules.push(ex.module);
+      }
+    }
+    const survConflicts = Object.values(survSlots).filter(x => x.modules.length > 1);
+    if (survConflicts.length === 0) {
+      console.log('✅ VÉRIFICATION: 0 conflit de surveillance — planning propre!');
+    } else {
+      console.warn(`❌ VÉRIFICATION: ${survConflicts.length} conflit(s) de surveillance:`);
+      survConflicts.slice(0, 10).forEach(c =>
+        console.warn(`   ${c.name} → ${c.modules.join(' & ')}`)
+      );
+      if (survConflicts.length > 10) console.warn(`   ... +${survConflicts.length - 10} autres`);
+    }
 
     res.json({
       success: true,
       results: {
-        scheduled:      scheduledExams,
-        totalScheduled: scheduledExams.length,
+        scheduled:            scheduledExams,
+        totalScheduled:       scheduledExams.length,
         conflicts,
-        totalConflicts: conflicts.length,
+        totalConflicts:       conflicts.length,
+        surveillanceConflicts: survConflicts.length,
         professorDistribution: profDist,
-        period:         SESSION_CONFIG.normale,
+        period:               SESSION_CONFIG.normale,
       },
     });
 
